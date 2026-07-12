@@ -1,22 +1,33 @@
-//! A unified interface for extracting common archive formats in-memory.
+//! A unified interface for extracting and creating common archive formats in-memory.
 //!
-//! This crate provides a simple, safe API for extracting various archive formats
-//! including ZIP, TAR (with multiple compression options), 7-Zip, and single-file
-//! compression formats. All extraction happens in-memory without touching the disk.
+//! This crate provides a simple, safe API for extracting and creating various
+//! archive formats including ZIP, TAR (with multiple compression options),
+//! 7-Zip, ar/deb, and single-file compression formats. Everything happens
+//! in-memory without touching the disk.
+//! 
+//! This also means this crate isn't great for streaming really big archives.
+//! It's more of an ergonomic wrapper for applications that want usage safety
+//! and don't want to import and handle all the deps themselves.
 //!
 //! # Features
 //!
-//! - **Unified API**: Single interface for all archive formats
-//! - **In-memory extraction**: No disk I/O required
+//! - **Unified API**: Single interface for extracting and creating all supported archive formats
+//! - **In-memory**: No disk I/O required
 //! - **Safety limits**: Protection against zip bombs, path traversal attacks, and resource exhaustion
-//! - **Pure Rust**: Minimal C dependencies (only bzip2)
+//! - **Almost all Rust**: Minimal C dependencies (only bzip2)
 //! - **Cross-platform**: Works on Linux, macOS, Windows (x86_64, ARM64)
 //!
 //! # Supported Formats
 //!
+//! Every format below can be both extracted ([`ArchiveExtractor`]) and
+//! created ([`ArchiveBuilder`]), with two narrow exceptions noted on
+//! [`ArchiveBuilder`] itself: `.7z` symlinks, and directories/symlinks in
+//! `.ar`/`.deb` (the ar format has no concept of either).
+//!
 //! - **ZIP** (`.zip`)
 //! - **TAR** (`.tar`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.tar.zst`, `.tar.lz4`)
 //! - **7-Zip** (`.7z`)
+//! - **ar / Debian packages** (`.ar`, `.deb`)
 //! - **Single-file compression** (`.gz`, `.bz2`, `.xz`, `.lz4`, `.zst`)
 //!
 //! # Examples
@@ -43,6 +54,24 @@
 //!         println!("File: {} ({} bytes)", path, data.len());
 //!     }
 //! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Creating Archives
+//!
+//! ```no_run
+//! use archive::{ArchiveBuilder, ArchiveEntry, ArchiveFormat};
+//! use std::fs;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let entries = vec![
+//!     ArchiveEntry::file("hello.txt", b"Hello, World!".to_vec()),
+//!     ArchiveEntry::directory("empty-dir"),
+//! ];
+//!
+//! let bytes = ArchiveBuilder::new().build(entries, ArchiveFormat::TarGz)?;
+//! fs::write("example.tar.gz", bytes)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -94,7 +123,7 @@
 //!
 //! # Safety
 //!
-//! This crate includes built-in protections against:
+//! [`ArchiveExtractor`] includes built-in protections against:
 //! - **Zip bombs**: Files that expand to enormous sizes
 //! - **Resource exhaustion**: Configurable size limits
 //! - **Path traversal**: Safe handling of archive paths
@@ -102,6 +131,10 @@
 //! Default limits:
 //! - Maximum file size: 100 MB
 //! - Maximum total extraction size: 1 GB
+//!
+//! [`ArchiveBuilder`] validates every entry's path (and, for symlinks, its
+//! target) the same way extraction does, so an archive assembled from
+//! less-trusted filenames can't come out containing `..` or absolute paths.
 //!
 //! # Error Handling
 //!
@@ -123,11 +156,13 @@
 //! # }
 //! ```
 
+pub mod builder;
 pub mod error;
 pub mod extractor;
 pub mod format;
 pub mod path_safety;
 
+pub use builder::ArchiveBuilder;
 pub use error::{ArchiveError, Result};
 pub use extractor::{ArchiveEntry, ArchiveExtractor};
 pub use format::ArchiveFormat;

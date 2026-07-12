@@ -8,6 +8,18 @@ use crate::error::{ArchiveError, Result};
 use crate::format::ArchiveFormat;
 use crate::path_safety::validate_path;
 use std::io::{Cursor, Read, Write};
+use std::path::Path;
+
+/// Converts a filesystem path into an archive-internal path string.
+///
+/// Archive formats (zip, tar) store paths as portable, forward-slash
+/// separated strings — they aren't tied to the host OS's path conventions
+/// the way [`std::path::Path`] is. On Windows in particular, `Path`'s
+/// `Display`/`to_string_lossy` output uses `\` as a separator, which isn't
+/// a valid archive path separator, so it's normalized to `/` here.
+fn path_to_archive_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
 
 /// Unix mode bits identifying a symbolic link (`S_IFLNK`), as stored in the
 /// upper 16 bits of a ZIP entry's `unix_mode()`.
@@ -165,6 +177,64 @@ pub enum ArchiveEntry {
 }
 
 impl ArchiveEntry {
+    /// Creates a regular file entry.
+    ///
+    /// Archive paths are portable, forward-slash separated strings rather
+    /// than [`std::path::Path`] values — `path` accepts anything
+    /// path-like (`&str`, `String`, `&Path`, `PathBuf`, ...) and is
+    /// normalized to that form internally. This doesn't validate the
+    /// path; that happens when the entry is passed to
+    /// [`crate::ArchiveBuilder::build`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use archive::ArchiveEntry;
+    ///
+    /// let entry = ArchiveEntry::file("hello.txt", b"Hello, World!".to_vec());
+    /// ```
+    pub fn file(path: impl AsRef<Path>, data: impl Into<Vec<u8>>) -> Self {
+        Self::File {
+            path: path_to_archive_string(path.as_ref()),
+            data: data.into(),
+        }
+    }
+
+    /// Creates a directory entry.
+    ///
+    /// See [`ArchiveEntry::file`] for how `path` is accepted.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use archive::ArchiveEntry;
+    ///
+    /// let entry = ArchiveEntry::directory("empty-dir");
+    /// ```
+    pub fn directory(path: impl AsRef<Path>) -> Self {
+        Self::Directory {
+            path: path_to_archive_string(path.as_ref()),
+        }
+    }
+
+    /// Creates a symlink entry.
+    ///
+    /// See [`ArchiveEntry::file`] for how `path` and `target` are accepted.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use archive::ArchiveEntry;
+    ///
+    /// let entry = ArchiveEntry::symlink("link.txt", "target.txt");
+    /// ```
+    pub fn symlink(path: impl AsRef<Path>, target: impl AsRef<Path>) -> Self {
+        Self::Symlink {
+            path: path_to_archive_string(path.as_ref()),
+            target: path_to_archive_string(target.as_ref()),
+        }
+    }
+
     /// Returns the path of this entry within the archive.
     pub fn path(&self) -> &str {
         match self {
