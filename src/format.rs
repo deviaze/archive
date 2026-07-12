@@ -191,6 +191,28 @@ impl ArchiveFormat {
     pub fn is_supported_mime(mime: &MimeType) -> bool {
         ArchiveFormat::try_from(mime).is_ok()
     }
+
+    /// Checks whether this format represents a single-file compression format
+    /// (as opposed to a multi-file archive format).
+    ///
+    /// Single-file formats (gzip, bzip2, XZ, LZ4, Zstandard) compress exactly
+    /// one file and do not support directory structures or multiple entries.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use archive::ArchiveFormat;
+    ///
+    /// assert!(ArchiveFormat::Gz.is_single_file());
+    /// assert!(!ArchiveFormat::Zip.is_single_file());
+    /// assert!(!ArchiveFormat::TarGz.is_single_file());
+    /// ```
+    pub fn is_single_file(&self) -> bool {
+        matches!(
+            self,
+            Self::Gz | Self::Bz2 | Self::Xz | Self::Lz4 | Self::Zst
+        )
+    }
 }
 
 impl TryFrom<&MimeType> for ArchiveFormat {
