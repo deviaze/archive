@@ -69,13 +69,14 @@ fn reserve_exact(buf: &mut Vec<u8>, size: usize) -> Result<()> {
 /// [`ArchiveError::FileTooLarge`] as soon as more than `limit` bytes have
 /// been produced, instead of letting a decompression bomb fully materialize
 /// in memory before the size is checked.
-fn bounded_read_to_end(reader: &mut (impl Read + ?Sized), buf: &mut Vec<u8>, limit: usize) -> Result<()> {
+fn bounded_read_to_end(reader: &mut (impl Read + ?Sized), buf: &mut Vec<u8>, limit: usize, path: Option<&str>) -> Result<()> {
     let mut writer = BoundedWriter::new(buf, limit);
     let result = std::io::copy(reader, &mut writer);
     let total_seen = writer.total_seen;
     result.map(|_| ()).map_err(|e| {
         if total_seen > limit {
             ArchiveError::FileTooLarge {
+                path: path.map(|s| s.to_owned()),
                 size: total_seen,
                 limit,
             }
@@ -569,6 +570,7 @@ impl ArchiveExtractor {
                 let size = file.size() as usize;
                 if size > self.max_file_size {
                     return Err(ArchiveError::FileTooLarge {
+                        path: Some(path),
                         size,
                         limit: self.max_file_size,
                     });
@@ -576,7 +578,7 @@ impl ArchiveExtractor {
 
                 let mut contents = Vec::new();
                 reserve_exact(&mut contents, size)?;
-                bounded_read_to_end(&mut file, &mut contents, self.max_file_size)?;
+                bounded_read_to_end(&mut file, &mut contents, self.max_file_size, Some(&path))?;
 
                 total_size += contents.len();
                 if total_size > self.max_total_size {
@@ -691,14 +693,14 @@ impl ArchiveExtractor {
 
         // Single-pass extraction: validate sizes and extract contents in one iteration
         let result = archive.for_each_entries(|entry, reader| {
-            let path = entry.name().to_string();
+            let path = entry.name();
             if let Err(e) = validate_path(&path) {
                 early_error = Some(e);
                 return Ok(false); // Stop iteration
             }
 
             if entry.is_directory() {
-                files.push(ArchiveEntry::Directory { path });
+                files.push(ArchiveEntry::Directory { path: path.to_string() });
             } else {
                 // See the comment in extract_zip: the declared size is
                 // untrusted metadata, so it's only used to fast-reject an
@@ -707,6 +709,7 @@ impl ArchiveExtractor {
                 let size = entry.size() as usize;
                 if size > self.max_file_size {
                     early_error = Some(ArchiveError::FileTooLarge {
+                        path: Some(path.to_string()),
                         size,
                         limit: self.max_file_size,
                     });
@@ -718,7 +721,7 @@ impl ArchiveExtractor {
                     early_error = Some(e);
                     return Ok(false); // Stop iteration
                 }
-                if let Err(e) = bounded_read_to_end(reader, &mut contents, self.max_file_size) {
+                if let Err(e) = bounded_read_to_end(reader, &mut contents, self.max_file_size, Some(path)) {
                     early_error = Some(e);
                     return Ok(false); // Stop iteration
                 }
@@ -733,7 +736,7 @@ impl ArchiveExtractor {
                 }
 
                 files.push(ArchiveEntry::File {
-                    path,
+                    path: path.to_string(),
                     data: contents,
                 });
             }
@@ -755,23 +758,25 @@ impl ArchiveExtractor {
 
     fn extract_single_gz(&self, data: &[u8]) -> Result<Vec<ArchiveEntry>> {
         let cursor = Cursor::new(data);
-        let mut decoder = flate2::read::GzDecoder::new(cursor);
-        let mut decompressed = Vec::new();
-        bounded_read_to_end(&mut decoder, &mut decompressed, self.max_file_size)?;
 
+        let header_cursor = Cursor::new(data);
+        let header_decoder = flate2::read::GzDecoder::new(header_cursor);
         // Try to extract original filename from gzip header. Fall back to
         // "data" if it's missing, not valid UTF-8, or unsafe (a gzip header
         // filename is attacker-controlled and could contain e.g. "../..").
-        let path = decoder
+        let path = header_decoder
             .header()
             .and_then(|h| h.filename())
             .and_then(|f| std::str::from_utf8(f).ok())
             .filter(|f| validate_path(f).is_ok())
-            .unwrap_or("data")
-            .to_string();
+            .unwrap_or("data");
+
+        let mut decoder = flate2::read::GzDecoder::new(cursor);
+        let mut decompressed = Vec::new();
+        bounded_read_to_end(&mut decoder, &mut decompressed, self.max_file_size, Some(path))?;
 
         Ok(vec![ArchiveEntry::File {
-            path,
+            path: path.to_string(),
             data: decompressed,
         }])
     }
@@ -780,7 +785,7 @@ impl ArchiveExtractor {
         let cursor = Cursor::new(data);
         let mut decoder = bzip2::read::BzDecoder::new(cursor);
         let mut decompressed = Vec::new();
-        bounded_read_to_end(&mut decoder, &mut decompressed, self.max_file_size)?;
+        bounded_read_to_end(&mut decoder, &mut decompressed, self.max_file_size, None)?;
 
         Ok(vec![ArchiveEntry::File {
             path: "data".to_string(),
@@ -799,6 +804,7 @@ impl ArchiveExtractor {
         result.map_err(|e| {
             if total_seen > self.max_file_size {
                 ArchiveError::FileTooLarge {
+                    path: None,
                     size: total_seen,
                     limit: self.max_file_size,
                 }
@@ -817,7 +823,7 @@ impl ArchiveExtractor {
         let cursor = Cursor::new(data);
         let mut decoder = lz4::Decoder::new(cursor)?;
         let mut decompressed = Vec::new();
-        bounded_read_to_end(&mut decoder, &mut decompressed, self.max_file_size)?;
+        bounded_read_to_end(&mut decoder, &mut decompressed, self.max_file_size, None)?;
 
         Ok(vec![ArchiveEntry::File {
             path: "data".to_string(),
@@ -829,7 +835,7 @@ impl ArchiveExtractor {
         let cursor = Cursor::new(data);
         let mut decoder = zstd::stream::read::Decoder::new(cursor)?;
         let mut decompressed = Vec::new();
-        bounded_read_to_end(&mut decoder, &mut decompressed, self.max_file_size)?;
+        bounded_read_to_end(&mut decoder, &mut decompressed, self.max_file_size, None)?;
 
         Ok(vec![ArchiveEntry::File {
             path: "data".to_string(),
@@ -869,6 +875,7 @@ impl ArchiveExtractor {
                 let size = entry.size() as usize;
                 if size > self.max_file_size {
                     return Err(ArchiveError::FileTooLarge {
+                        path: Some(path),
                         size,
                         limit: self.max_file_size,
                     });
@@ -876,7 +883,7 @@ impl ArchiveExtractor {
 
                 let mut contents = Vec::new();
                 reserve_exact(&mut contents, size)?;
-                bounded_read_to_end(&mut entry, &mut contents, self.max_file_size)?;
+                bounded_read_to_end(&mut entry, &mut contents, self.max_file_size, Some(&path))?;
 
                 total_size += contents.len();
                 if total_size > self.max_total_size {
@@ -917,6 +924,7 @@ impl ArchiveExtractor {
             let size = entry.header().size() as usize;
             if size > self.max_file_size {
                 return Err(ArchiveError::FileTooLarge {
+                    path: Some(path),
                     size,
                     limit: self.max_file_size,
                 });
@@ -924,7 +932,7 @@ impl ArchiveExtractor {
 
             let mut contents = Vec::new();
             reserve_exact(&mut contents, size)?;
-            bounded_read_to_end(&mut entry, &mut contents, self.max_file_size)?;
+            bounded_read_to_end(&mut entry, &mut contents, self.max_file_size, Some(&path))?;
 
             total_size += contents.len();
             if total_size > self.max_total_size {

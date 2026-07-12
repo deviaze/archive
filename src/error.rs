@@ -82,6 +82,8 @@ pub enum ArchiveError {
     /// - `limit`: The configured maximum file size in bytes
     #[error("File too large: {size} bytes exceeds limit of {limit} bytes")]
     FileTooLarge {
+        /// The path of the file that exceeded the limit
+        path: Option<String>,
         /// The actual size of the file that exceeded the limit
         size: usize,
         /// The configured maximum file size
