@@ -344,6 +344,7 @@ impl ArchiveEntry {
 pub struct ArchiveExtractor {
     max_file_size: usize,
     max_total_size: usize,
+    allow_unsafe_path_traversals: bool,
 }
 
 impl Default for ArchiveExtractor {
@@ -351,6 +352,7 @@ impl Default for ArchiveExtractor {
         Self {
             max_file_size: 100 * 1024 * 1024,   // 100 MB per file
             max_total_size: 1024 * 1024 * 1024, // 1 GB total
+            allow_unsafe_path_traversals: false,
         }
     }
 }
@@ -432,6 +434,29 @@ impl ArchiveExtractor {
     /// ```
     pub fn with_max_total_size(mut self, size: usize) -> Self {
         self.max_total_size = size;
+        self
+    }
+
+    /// Controls whether entry paths (and symlink targets) are allowed to
+    /// contain `..` components or be absolute.
+    ///
+    /// By default (`false`), extraction rejects any such entry with
+    /// [`ArchiveError::UnsafePath`] to protect against path traversal
+    /// attacks. Only set this to `true` if the caller independently
+    /// re-validates paths before writing extracted entries to disk.
+    ///
+    /// This method uses the builder pattern, allowing you to chain configuration calls.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use archive::ArchiveExtractor;
+    ///
+    /// let extractor = ArchiveExtractor::new()
+    ///     .allow_unsafe_path_traversals(true);
+    /// ```
+    pub fn allow_unsafe_path_traversals(mut self, allow: bool) -> Self {
+        self.allow_unsafe_path_traversals = allow;
         self
     }
 
@@ -554,7 +579,7 @@ impl ArchiveExtractor {
             let mut file = archive.by_index(i)?;
             let is_directory = file.is_dir();
             let path = file.name().to_string();
-            validate_path(&path)?;
+            validate_path(&path, self.allow_unsafe_path_traversals)?;
 
             let is_symlink = file
                 .unix_mode()
@@ -590,7 +615,7 @@ impl ArchiveExtractor {
 
                 if is_symlink {
                     let target = String::from_utf8_lossy(&contents).into_owned();
-                    validate_path(&target)?;
+                    validate_path(&target, self.allow_unsafe_path_traversals)?;
                     files.push(ArchiveEntry::Symlink { path, target });
                 } else {
                     files.push(ArchiveEntry::File {
@@ -694,7 +719,7 @@ impl ArchiveExtractor {
         // Single-pass extraction: validate sizes and extract contents in one iteration
         let result = archive.for_each_entries(|entry, reader| {
             let path = entry.name();
-            if let Err(e) = validate_path(&path) {
+            if let Err(e) = validate_path(path, self.allow_unsafe_path_traversals) {
                 early_error = Some(e);
                 return Ok(false); // Stop iteration
             }
@@ -768,7 +793,7 @@ impl ArchiveExtractor {
             .header()
             .and_then(|h| h.filename())
             .and_then(|f| std::str::from_utf8(f).ok())
-            .filter(|f| validate_path(f).is_ok())
+            .filter(|f| validate_path(f, self.allow_unsafe_path_traversals).is_ok())
             .unwrap_or("data");
 
         let mut decoder = flate2::read::GzDecoder::new(cursor);
@@ -853,7 +878,7 @@ impl ArchiveExtractor {
         for entry_result in archive.entries()? {
             let mut entry = entry_result?;
             let path = entry.path()?.to_string_lossy().to_string();
-            validate_path(&path)?;
+            validate_path(&path, self.allow_unsafe_path_traversals)?;
 
             let entry_type = entry.header().entry_type();
             let is_directory = entry_type.is_dir();
@@ -864,7 +889,7 @@ impl ArchiveExtractor {
                     .link_name()?
                     .map(|t| t.to_string_lossy().to_string())
                     .unwrap_or_default();
-                validate_path(&target)?;
+                validate_path(&target, self.allow_unsafe_path_traversals)?;
 
                 files.push(ArchiveEntry::Symlink { path, target });
             } else if !is_directory {
@@ -915,7 +940,7 @@ impl ArchiveExtractor {
         while let Some(entry_result) = archive.next_entry() {
             let mut entry = entry_result?;
             let path = String::from_utf8_lossy(entry.header().identifier()).to_string();
-            validate_path(&path)?;
+            validate_path(&path, self.allow_unsafe_path_traversals)?;
 
             // See the comment in extract_zip: the declared size is
             // untrusted metadata, so it's only used to fast-reject an
@@ -958,15 +983,18 @@ mod tests {
         let extractor = ArchiveExtractor::new();
         assert_eq!(extractor.max_file_size, 100 * 1024 * 1024);
         assert_eq!(extractor.max_total_size, 1024 * 1024 * 1024);
+        assert!(!extractor.allow_unsafe_path_traversals);
     }
 
     #[test]
     fn test_builder_pattern() {
         let extractor = ArchiveExtractor::new()
             .with_max_file_size(50 * 1024 * 1024)
-            .with_max_total_size(500 * 1024 * 1024);
+            .with_max_total_size(500 * 1024 * 1024)
+            .allow_unsafe_path_traversals(true);
 
         assert_eq!(extractor.max_file_size, 50 * 1024 * 1024);
         assert_eq!(extractor.max_total_size, 500 * 1024 * 1024);
+        assert!(extractor.allow_unsafe_path_traversals);
     }
 }

@@ -14,18 +14,24 @@ use crate::error::{ArchiveError, Result};
 /// Validates that an archive-supplied path (entry name or symlink target) is
 /// safe to join onto an extraction directory.
 ///
-/// Rejects:
+/// Always rejects:
 /// - empty paths
 /// - paths containing a NUL byte
+///
+/// Unless `allow_unsafe_path_traversals` is `true`, also rejects:
 /// - absolute paths (`/foo`, `\foo`, `C:\foo`, `C:/foo`)
 /// - paths with any `..` component
-pub fn validate_path(path: &str) -> Result<()> {
+pub fn validate_path(path: &str, allow_unsafe_path_traversals: bool) -> Result<()> {
     if path.is_empty() {
         return Err(ArchiveError::UnsafePath(path.to_string()));
     }
 
     if path.contains('\0') {
         return Err(ArchiveError::UnsafePath(path.to_string()));
+    }
+
+    if allow_unsafe_path_traversals {
+        return Ok(());
     }
 
     if path.starts_with('/') || path.starts_with('\\') {
@@ -53,31 +59,44 @@ mod tests {
 
     #[test]
     fn accepts_normal_relative_paths() {
-        assert!(validate_path("foo/bar.txt").is_ok());
-        assert!(validate_path("foo.txt").is_ok());
-        assert!(validate_path("./foo/bar.txt").is_ok());
-        assert!(validate_path("a/b/c/d.txt").is_ok());
+        assert!(validate_path("foo/bar.txt", false).is_ok());
+        assert!(validate_path("foo.txt", false).is_ok());
+        assert!(validate_path("./foo/bar.txt", false).is_ok());
+        assert!(validate_path("a/b/c/d.txt", false).is_ok());
     }
 
     #[test]
     fn rejects_parent_dir_components() {
-        assert!(validate_path("../etc/passwd").is_err());
-        assert!(validate_path("foo/../../etc/passwd").is_err());
-        assert!(validate_path("foo/bar/..").is_err());
-        assert!(validate_path("..\\..\\windows\\system32").is_err());
+        assert!(validate_path("../etc/passwd", false).is_err());
+        assert!(validate_path("foo/../../etc/passwd", false).is_err());
+        assert!(validate_path("foo/bar/..", false).is_err());
+        assert!(validate_path("..\\..\\windows\\system32", false).is_err());
     }
 
     #[test]
     fn rejects_absolute_paths() {
-        assert!(validate_path("/etc/passwd").is_err());
-        assert!(validate_path("\\Windows\\System32").is_err());
-        assert!(validate_path("C:\\Windows\\System32").is_err());
-        assert!(validate_path("C:/Windows/System32").is_err());
+        assert!(validate_path("/etc/passwd", false).is_err());
+        assert!(validate_path("\\Windows\\System32", false).is_err());
+        assert!(validate_path("C:\\Windows\\System32", false).is_err());
+        assert!(validate_path("C:/Windows/System32", false).is_err());
     }
 
     #[test]
     fn rejects_empty_and_nul() {
-        assert!(validate_path("").is_err());
-        assert!(validate_path("foo\0bar").is_err());
+        assert!(validate_path("", false).is_err());
+        assert!(validate_path("foo\0bar", false).is_err());
+    }
+
+    #[test]
+    fn allow_unsafe_path_traversals_permits_parent_dir_and_absolute_paths() {
+        assert!(validate_path("../etc/passwd", true).is_ok());
+        assert!(validate_path("/etc/passwd", true).is_ok());
+        assert!(validate_path("C:\\Windows\\System32", true).is_ok());
+    }
+
+    #[test]
+    fn allow_unsafe_path_traversals_still_rejects_empty_and_nul() {
+        assert!(validate_path("", true).is_err());
+        assert!(validate_path("foo\0bar", true).is_err());
     }
 }

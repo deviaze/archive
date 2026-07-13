@@ -70,7 +70,7 @@
 //!     ArchiveEntry::directory("empty-dir"),
 //! ];
 //!
-//! let bytes = ArchiveBuilder::new().build(entries, ArchiveFormat::TarGz)?;
+//! let bytes = ArchiveBuilder::new().build(&entries, ArchiveFormat::TarGz)?;
 //! fs::write("example.tar.gz", bytes)?;
 //! # Ok(())
 //! # }

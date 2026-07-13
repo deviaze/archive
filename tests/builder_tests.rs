@@ -22,7 +22,7 @@ fn round_trip(format: ArchiveFormat) {
         ArchiveEntry::directory("empty-dir"),
     ];
 
-    let bytes = ArchiveBuilder::new().build(entries, format).unwrap();
+    let bytes = ArchiveBuilder::new().build(&entries, format).unwrap();
     let extracted = ArchiveExtractor::new().extract(&bytes, format).unwrap();
 
     let hello = extracted
@@ -51,7 +51,7 @@ fn symlink_round_trip(format: ArchiveFormat) {
         ArchiveEntry::symlink("link.txt", "target.txt"),
     ];
 
-    let bytes = ArchiveBuilder::new().build(entries, format).unwrap();
+    let bytes = ArchiveBuilder::new().build(&entries, format).unwrap();
     let extracted = ArchiveExtractor::new().extract(&bytes, format).unwrap();
 
     let link = extracted
@@ -87,7 +87,7 @@ fn ar_round_trip() {
     ];
 
     for format in [ArchiveFormat::Ar, ArchiveFormat::Deb] {
-        let bytes = ArchiveBuilder::new().build(entries.clone(), format).unwrap();
+        let bytes = ArchiveBuilder::new().build(&entries, format).unwrap();
         let extracted = ArchiveExtractor::new().extract(&bytes, format).unwrap();
 
         assert_eq!(extracted.len(), 2, "{format:?}: {extracted:?}");
@@ -100,7 +100,7 @@ fn ar_round_trip() {
 fn ar_rejects_directory_entries() {
     let entries = vec![ArchiveEntry::directory("some-dir")];
     let err = ArchiveBuilder::new()
-        .build(entries, ArchiveFormat::Ar)
+        .build(&entries, ArchiveFormat::Ar)
         .unwrap_err();
     assert!(matches!(err, ArchiveError::UnsupportedFormat(_)), "{err:?}");
 }
@@ -109,7 +109,7 @@ fn ar_rejects_directory_entries() {
 fn ar_rejects_symlink_entries() {
     let entries = vec![ArchiveEntry::symlink("link", "target")];
     let err = ArchiveBuilder::new()
-        .build(entries, ArchiveFormat::Deb)
+        .build(&entries, ArchiveFormat::Deb)
         .unwrap_err();
     assert!(matches!(err, ArchiveError::UnsupportedFormat(_)), "{err:?}");
 }
@@ -122,7 +122,7 @@ fn sevenz_round_trip() {
     ];
 
     let bytes = ArchiveBuilder::new()
-        .build(entries, ArchiveFormat::SevenZ)
+        .build(&entries, ArchiveFormat::SevenZ)
         .unwrap();
     let extracted = ArchiveExtractor::new()
         .extract(&bytes, ArchiveFormat::SevenZ)
@@ -142,7 +142,7 @@ fn sevenz_round_trip() {
 fn sevenz_rejects_symlink_entries() {
     let entries = vec![ArchiveEntry::symlink("link", "target")];
     let err = ArchiveBuilder::new()
-        .build(entries, ArchiveFormat::SevenZ)
+        .build(&entries, ArchiveFormat::SevenZ)
         .unwrap_err();
     assert!(matches!(err, ArchiveError::UnsupportedFormat(_)), "{err:?}");
 }
@@ -157,7 +157,7 @@ fn single_file_formats_round_trip() {
         ArchiveFormat::Zst,
     ] {
         let entries = vec![ArchiveEntry::file("hello.txt", b"Hello, World!".to_vec())];
-        let bytes = ArchiveBuilder::new().build(entries, format).unwrap();
+        let bytes = ArchiveBuilder::new().build(&entries, format).unwrap();
         let extracted = ArchiveExtractor::new().extract(&bytes, format).unwrap();
 
         assert_eq!(extracted.len(), 1, "{format:?}: {extracted:?}");
@@ -176,7 +176,7 @@ fn single_file_formats_reject_multiple_entries() {
         ArchiveEntry::file("b.txt", b"b".to_vec()),
     ];
     let err = ArchiveBuilder::new()
-        .build(entries, ArchiveFormat::Gz)
+        .build(&entries, ArchiveFormat::Gz)
         .unwrap_err();
     assert!(matches!(err, ArchiveError::UnsupportedFormat(_)), "{err:?}");
 }
@@ -185,7 +185,7 @@ fn single_file_formats_reject_multiple_entries() {
 fn single_file_formats_reject_directory_entries() {
     let entries = vec![ArchiveEntry::directory("some-dir")];
     let err = ArchiveBuilder::new()
-        .build(entries, ArchiveFormat::Zst)
+        .build(&entries, ArchiveFormat::Zst)
         .unwrap_err();
     assert!(matches!(err, ArchiveError::UnsupportedFormat(_)), "{err:?}");
 }
@@ -226,7 +226,7 @@ fn build_rejects_unsafe_entry_path() {
     let entries = vec![ArchiveEntry::file("../../etc/passwd", b"pwned".to_vec())];
 
     let err = ArchiveBuilder::new()
-        .build(entries, ArchiveFormat::Zip)
+        .build(&entries, ArchiveFormat::Zip)
         .unwrap_err();
     assert!(matches!(err, ArchiveError::UnsafePath(_)), "{err:?}");
 }
@@ -236,7 +236,7 @@ fn build_rejects_unsafe_symlink_target() {
     let entries = vec![ArchiveEntry::symlink("link.txt", "../../etc/passwd")];
 
     let err = ArchiveBuilder::new()
-        .build(entries, ArchiveFormat::TarGz)
+        .build(&entries, ArchiveFormat::TarGz)
         .unwrap_err();
     assert!(matches!(err, ArchiveError::UnsafePath(_)), "{err:?}");
 }
