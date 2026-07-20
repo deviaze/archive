@@ -10,6 +10,18 @@ use crate::format::ArchiveFormat;
 use crate::path_safety::validate_path;
 use std::io::{Cursor, Write};
 
+/// xz compression preset used when *writing* `.xz` and `.tar.xz`. 6 is what
+/// the `xz` CLI defaults to, and matches the "default" presets the other
+/// formats here are built with.
+///
+/// Encoding goes through `liblzma` rather than `lzma-rs` (which the extractor
+/// still decodes with) because `lzma-rs`' LZMA2 encoder only ever emits
+/// `uncompressed reset dict` chunks — it produces a valid xz stream that is
+/// *larger* than its input, so a `.tar.xz` built with it came out bigger than
+/// the plain `.tar`. `lzma-rs`' decoder is a real implementation, so it's kept
+/// for reading.
+const XZ_COMPRESSION_PRESET: u32 = 6;
+
 /// Builds archives in-memory from a list of [`ArchiveEntry`] values.
 ///
 /// This is the inverse of [`crate::ArchiveExtractor`]: instead of turning
@@ -283,17 +295,10 @@ impl ArchiveBuilder {
     }
 
     fn build_tar_xz(&self, entries: &[ArchiveEntry]) -> Result<Vec<u8>> {
-        // lzma_rs only exposes a one-shot xz_compress(&mut R, &mut W), not
-        // a streaming Write encoder, so the tar has to be fully built in
-        // memory first and then compressed in a single pass.
-        let mut builder = tar::Builder::new(Vec::new());
+        let encoder = liblzma::write::XzEncoder::new(Vec::new(), XZ_COMPRESSION_PRESET);
+        let mut builder = tar::Builder::new(encoder);
         Self::write_tar_entries(&mut builder, entries, self.allow_unsafe_path_traversals)?;
-        let tar_bytes = builder.into_inner()?;
-
-        let mut output = Vec::new();
-        lzma_rs::xz_compress(&mut Cursor::new(tar_bytes), &mut output)
-            .map_err(|e| ArchiveError::InvalidArchive(e.to_string()))?;
-        Ok(output)
+        Ok(builder.into_inner()?.finish()?)
     }
 
     fn build_ar(&self, entries: &[ArchiveEntry]) -> Result<Vec<u8>> {
@@ -403,10 +408,9 @@ impl ArchiveBuilder {
 
     fn build_single_xz(&self, entries: &[ArchiveEntry]) -> Result<Vec<u8>> {
         let (_path, data) = Self::single_file_entry(entries, self.allow_unsafe_path_traversals)?;
-        let mut output = Vec::new();
-        lzma_rs::xz_compress(&mut Cursor::new(data), &mut output)
-            .map_err(|e| ArchiveError::InvalidArchive(e.to_string()))?;
-        Ok(output)
+        let mut encoder = liblzma::write::XzEncoder::new(Vec::new(), XZ_COMPRESSION_PRESET);
+        encoder.write_all(&data)?;
+        Ok(encoder.finish()?)
     }
 
     fn build_single_lz4(&self, entries: &[ArchiveEntry]) -> Result<Vec<u8>> {
