@@ -9,6 +9,7 @@ use crate::format::ArchiveFormat;
 use crate::path_safety::validate_path;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 /// Converts a filesystem path into an archive-internal path string.
 ///
@@ -34,6 +35,83 @@ const S_IFMT: u32 = 0o170000;
 /// many small files. Individual entries are still checked precisely
 /// afterwards in [`ArchiveExtractor::process_tar_entries`].
 const TAR_XZ_HEADER_OVERHEAD_ALLOWANCE: usize = 64 * 1024 * 1024;
+
+/// Permission bits mask (excludes the file-type bits packed into the same
+/// `st_mode`-shaped integer by formats like zip and 7z).
+pub(crate) const MODE_PERMISSION_MASK: u32 = 0o7777;
+
+/// The `FILE_ATTRIBUTE_UNIX_EXTENSION` flag 7-Zip sets on `windows_attributes`
+/// to indicate that the upper 16 bits hold a Unix `st_mode` value, following
+/// the same convention p7zip and zip's "Unix" host attributes use.
+pub(crate) const SEVENZ_UNIX_EXTENSION_FLAG: u32 = 0x8000;
+
+/// Converts a [`zip::DateTime`] (an MS-DOS date/time, 1980-2107, 2-second
+/// resolution) into a [`SystemTime`].
+///
+/// `zip::DateTime` intentionally has no conversion to `SystemTime` without
+/// opting into the `time` or `chrono` crate features, which this crate
+/// avoids pulling in just for this. The calendar math below (days-since-epoch
+/// via the "civil from days" / "days from civil" algorithm) is a standard,
+/// dependency-free way to do the conversion.
+fn zip_datetime_to_system_time(dt: zip::DateTime) -> SystemTime {
+    let days = days_from_civil(dt.year() as i64, dt.month() as u32, dt.day() as u32);
+    let secs = days * 86_400
+        + dt.hour() as i64 * 3_600
+        + dt.minute() as i64 * 60
+        + dt.second() as i64;
+    if secs >= 0 {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64)
+    } else {
+        SystemTime::UNIX_EPOCH - Duration::from_secs((-secs) as u64)
+    }
+}
+
+/// Converts a [`SystemTime`] into a [`zip::DateTime`], or `None` if it falls
+/// outside the MS-DOS date range zip can represent (1980-2107).
+///
+/// See [`zip_datetime_to_system_time`] for why this is hand-rolled.
+pub(crate) fn system_time_to_zip_datetime(time: SystemTime) -> Option<zip::DateTime> {
+    let secs = match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => -(e.duration().as_secs() as i64),
+    };
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let year: u16 = year.try_into().ok()?;
+    let hour = (rem / 3_600) as u8;
+    let minute = ((rem % 3_600) / 60) as u8;
+    let second = (rem % 60) as u8;
+    zip::DateTime::from_date_and_time(year, month as u8, day as u8, hour, minute, second).ok()
+}
+
+/// Howard Hinnant's "days from civil" algorithm: converts a proleptic
+/// Gregorian calendar date into a signed day count relative to
+/// 1970-01-01.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The inverse of [`days_from_civil`]: converts a signed day count relative
+/// to 1970-01-01 back into a proleptic Gregorian `(year, month, day)`.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
 
 /// A `Write` sink that stops accepting bytes once more than `limit` have
 /// been written, so a one-shot streaming decompressor (like `lzma-rs`'s
@@ -109,6 +187,14 @@ impl Write for BoundedWriter<'_> {
 /// entry, so states like "directory with file contents" or "symlink with no
 /// target" can't be represented.
 ///
+/// Every variant also carries `mode` (Unix permission bits, e.g. `0o644`)
+/// and `mtime` (last-modified time), both `Option` since not every format
+/// records them, and because they're only ever best-effort: a value that
+/// doesn't fit the target format's representation (e.g. an `mtime` before
+/// 1980 written to `.zip`) is simply omitted rather than erroring. Match
+/// arms that only care about `path`/`data`/`target` need a trailing `..` to
+/// ignore these.
+///
 /// # Examples
 ///
 /// ```no_run
@@ -121,15 +207,19 @@ impl Write for BoundedWriter<'_> {
 ///
 /// for entry in &entries {
 ///     match entry {
-///         ArchiveEntry::File { path, data } => {
+///         ArchiveEntry::File { path, data, .. } => {
 ///             println!("File: {} ({} bytes)", path, data.len());
 ///         }
-///         ArchiveEntry::Directory { path } => {
+///         ArchiveEntry::Directory { path, .. } => {
 ///             println!("Directory: {}", path);
 ///         }
-///         ArchiveEntry::Symlink { path, target } => {
+///         ArchiveEntry::Symlink { path, target, .. } => {
 ///             println!("Symlink: {} -> {}", path, target);
 ///         }
+///     }
+///
+///     if let Some(mode) = entry.mode() {
+///         println!("  mode: {:o}", mode);
 ///     }
 /// }
 /// # Ok(())
@@ -148,12 +238,22 @@ pub enum ArchiveEntry {
         path: String,
         /// The decompressed contents of the file.
         data: Vec<u8>,
+        /// The Unix permission bits (e.g. `0o644`), if the source format
+        /// records them.
+        mode: Option<u32>,
+        /// The last-modified time, if the source format records one.
+        mtime: Option<SystemTime>,
     },
 
     /// A directory entry.
     Directory {
         /// The path of the directory within the archive.
         path: String,
+        /// The Unix permission bits (e.g. `0o755`), if the source format
+        /// records them.
+        mode: Option<u32>,
+        /// The last-modified time, if the source format records one.
+        mtime: Option<SystemTime>,
     },
 
     /// A symbolic (or hard) link entry.
@@ -174,6 +274,10 @@ pub enum ArchiveEntry {
         path: String,
         /// The link target, as recorded in the archive.
         target: String,
+        /// The Unix permission bits, if the source format records them.
+        mode: Option<u32>,
+        /// The last-modified time, if the source format records one.
+        mtime: Option<SystemTime>,
     },
 }
 
@@ -198,6 +302,8 @@ impl ArchiveEntry {
         Self::File {
             path: path_to_archive_string(path.as_ref()),
             data: data.into(),
+            mode: None,
+            mtime: None,
         }
     }
 
@@ -215,6 +321,8 @@ impl ArchiveEntry {
     pub fn directory(path: impl AsRef<Path>) -> Self {
         Self::Directory {
             path: path_to_archive_string(path.as_ref()),
+            mode: None,
+            mtime: None,
         }
     }
 
@@ -233,15 +341,86 @@ impl ArchiveEntry {
         Self::Symlink {
             path: path_to_archive_string(path.as_ref()),
             target: path_to_archive_string(target.as_ref()),
+            mode: None,
+            mtime: None,
         }
+    }
+
+    /// Sets the Unix permission bits (e.g. `0o644`) on this entry.
+    ///
+    /// This method uses the builder pattern, allowing you to chain it onto
+    /// [`ArchiveEntry::file`], [`ArchiveEntry::directory`], or
+    /// [`ArchiveEntry::symlink`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use archive::ArchiveEntry;
+    ///
+    /// let entry = ArchiveEntry::file("hello.txt", b"Hello, World!".to_vec())
+    ///     .with_mode(0o644);
+    /// ```
+    pub fn with_mode(mut self, mode: u32) -> Self {
+        match &mut self {
+            ArchiveEntry::File { mode: m, .. }
+            | ArchiveEntry::Directory { mode: m, .. }
+            | ArchiveEntry::Symlink { mode: m, .. } => *m = Some(mode),
+        }
+        self
+    }
+
+    /// Sets the last-modified time on this entry.
+    ///
+    /// This method uses the builder pattern, allowing you to chain it onto
+    /// [`ArchiveEntry::file`], [`ArchiveEntry::directory`], or
+    /// [`ArchiveEntry::symlink`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use archive::ArchiveEntry;
+    /// use std::time::SystemTime;
+    ///
+    /// let entry = ArchiveEntry::file("hello.txt", b"Hello, World!".to_vec())
+    ///     .with_mtime(SystemTime::now());
+    /// ```
+    pub fn with_mtime(mut self, mtime: SystemTime) -> Self {
+        match &mut self {
+            ArchiveEntry::File { mtime: t, .. }
+            | ArchiveEntry::Directory { mtime: t, .. }
+            | ArchiveEntry::Symlink { mtime: t, .. } => *t = Some(mtime),
+        }
+        self
     }
 
     /// Returns the path of this entry within the archive.
     pub fn path(&self) -> &str {
         match self {
             ArchiveEntry::File { path, .. } => path,
-            ArchiveEntry::Directory { path } => path,
+            ArchiveEntry::Directory { path, .. } => path,
             ArchiveEntry::Symlink { path, .. } => path,
+        }
+    }
+
+    /// Returns the Unix permission bits (e.g. `0o644`) recorded for this
+    /// entry, or `None` if the source format didn't record one (or this
+    /// entry was constructed without [`ArchiveEntry::with_mode`]).
+    pub fn mode(&self) -> Option<u32> {
+        match self {
+            ArchiveEntry::File { mode, .. } => *mode,
+            ArchiveEntry::Directory { mode, .. } => *mode,
+            ArchiveEntry::Symlink { mode, .. } => *mode,
+        }
+    }
+
+    /// Returns the last-modified time recorded for this entry, or `None` if
+    /// the source format didn't record one (or this entry was constructed
+    /// without [`ArchiveEntry::with_mtime`]).
+    pub fn mtime(&self) -> Option<SystemTime> {
+        match self {
+            ArchiveEntry::File { mtime, .. } => *mtime,
+            ArchiveEntry::Directory { mtime, .. } => *mtime,
+            ArchiveEntry::Symlink { mtime, .. } => *mtime,
         }
     }
 
@@ -518,7 +697,7 @@ impl ArchiveExtractor {
     ///     Ok(files) => {
     ///         println!("Successfully extracted {} files", files.len());
     ///     }
-    ///     Err(ArchiveError::FileTooLarge { size, limit }) => {
+    ///     Err(ArchiveError::FileTooLarge { size, limit, .. }) => {
     ///         eprintln!("File too large: {} bytes (limit: {} bytes)", size, limit);
     ///     }
     ///     Err(ArchiveError::InvalidArchive(msg)) => {
@@ -584,6 +763,8 @@ impl ArchiveExtractor {
             let is_symlink = file
                 .unix_mode()
                 .is_some_and(|mode| mode & S_IFMT == S_IFLNK);
+            let mode = file.unix_mode().map(|mode| mode & MODE_PERMISSION_MASK);
+            let mtime = file.last_modified().map(zip_datetime_to_system_time);
 
             if !is_directory {
                 // The declared size is untrusted archive metadata: reject
@@ -616,15 +797,17 @@ impl ArchiveExtractor {
                 if is_symlink {
                     let target = String::from_utf8_lossy(&contents).into_owned();
                     validate_path(&target, self.allow_unsafe_path_traversals)?;
-                    files.push(ArchiveEntry::Symlink { path, target });
+                    files.push(ArchiveEntry::Symlink { path, target, mode, mtime });
                 } else {
                     files.push(ArchiveEntry::File {
                         path,
                         data: contents,
+                        mode,
+                        mtime,
                     });
                 }
             } else {
-                files.push(ArchiveEntry::Directory { path });
+                files.push(ArchiveEntry::Directory { path, mode, mtime });
             }
         }
 
@@ -724,8 +907,23 @@ impl ArchiveExtractor {
                 return Ok(false); // Stop iteration
             }
 
+            // 7-Zip has no dedicated Unix mode field: on Unix it's packed
+            // into the upper 16 bits of `windows_attributes`, flagged by
+            // `FILE_ATTRIBUTE_UNIX_EXTENSION` (0x8000) — the same convention
+            // p7zip and zip's "Unix" host attributes use.
+            let mode = (entry.has_windows_attributes
+                && entry.windows_attributes & SEVENZ_UNIX_EXTENSION_FLAG != 0)
+                .then_some((entry.windows_attributes >> 16) & MODE_PERMISSION_MASK);
+            let mtime = entry
+                .has_last_modified_date
+                .then(|| SystemTime::from(entry.last_modified_date()));
+
             if entry.is_directory() {
-                files.push(ArchiveEntry::Directory { path: path.to_string() });
+                files.push(ArchiveEntry::Directory {
+                    path: path.to_string(),
+                    mode,
+                    mtime,
+                });
             } else {
                 // See the comment in extract_zip: the declared size is
                 // untrusted metadata, so it's only used to fast-reject an
@@ -763,6 +961,8 @@ impl ArchiveExtractor {
                 files.push(ArchiveEntry::File {
                     path: path.to_string(),
                     data: contents,
+                    mode,
+                    mtime,
                 });
             }
             Ok(true)
@@ -795,6 +995,14 @@ impl ArchiveExtractor {
             .and_then(|f| std::str::from_utf8(f).ok())
             .filter(|f| validate_path(f, self.allow_unsafe_path_traversals).is_ok())
             .unwrap_or("data");
+        // A gzip header's MTIME field is 0 when the time is unset, per RFC
+        // 1952 §2.3.1 — treat that as "not recorded" rather than the Unix
+        // epoch.
+        let mtime = header_decoder
+            .header()
+            .map(|h| h.mtime())
+            .filter(|&secs| secs != 0)
+            .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64));
 
         let mut decoder = flate2::read::GzDecoder::new(cursor);
         let mut decompressed = Vec::new();
@@ -803,6 +1011,8 @@ impl ArchiveExtractor {
         Ok(vec![ArchiveEntry::File {
             path: path.to_string(),
             data: decompressed,
+            mode: None,
+            mtime,
         }])
     }
 
@@ -815,6 +1025,8 @@ impl ArchiveExtractor {
         Ok(vec![ArchiveEntry::File {
             path: "data".to_string(),
             data: decompressed,
+            mode: None,
+            mtime: None,
         }])
     }
 
@@ -841,6 +1053,8 @@ impl ArchiveExtractor {
         Ok(vec![ArchiveEntry::File {
             path: "data".to_string(),
             data: decompressed,
+            mode: None,
+            mtime: None,
         }])
     }
 
@@ -853,6 +1067,8 @@ impl ArchiveExtractor {
         Ok(vec![ArchiveEntry::File {
             path: "data".to_string(),
             data: decompressed,
+            mode: None,
+            mtime: None,
         }])
     }
 
@@ -865,6 +1081,8 @@ impl ArchiveExtractor {
         Ok(vec![ArchiveEntry::File {
             path: "data".to_string(),
             data: decompressed,
+            mode: None,
+            mtime: None,
         }])
     }
 
@@ -883,6 +1101,12 @@ impl ArchiveExtractor {
             let entry_type = entry.header().entry_type();
             let is_directory = entry_type.is_dir();
             let is_symlink = entry_type.is_symlink() || entry_type.is_hard_link();
+            let mode = entry.header().mode().ok().map(|mode| mode & MODE_PERMISSION_MASK);
+            let mtime = entry
+                .header()
+                .mtime()
+                .ok()
+                .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
 
             if is_symlink {
                 let target = entry
@@ -891,7 +1115,7 @@ impl ArchiveExtractor {
                     .unwrap_or_default();
                 validate_path(&target, self.allow_unsafe_path_traversals)?;
 
-                files.push(ArchiveEntry::Symlink { path, target });
+                files.push(ArchiveEntry::Symlink { path, target, mode, mtime });
             } else if !is_directory {
                 // See the comment in extract_zip: the declared size is
                 // untrusted metadata, so it's only used to fast-reject an
@@ -921,9 +1145,11 @@ impl ArchiveExtractor {
                 files.push(ArchiveEntry::File {
                     path,
                     data: contents,
+                    mode,
+                    mtime,
                 });
             } else {
-                files.push(ArchiveEntry::Directory { path });
+                files.push(ArchiveEntry::Directory { path, mode, mtime });
             }
         }
 
@@ -941,6 +1167,9 @@ impl ArchiveExtractor {
             let mut entry = entry_result?;
             let path = String::from_utf8_lossy(entry.header().identifier()).to_string();
             validate_path(&path, self.allow_unsafe_path_traversals)?;
+
+            let mode = Some(entry.header().mode() & MODE_PERMISSION_MASK);
+            let mtime = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(entry.header().mtime()));
 
             // See the comment in extract_zip: the declared size is
             // untrusted metadata, so it's only used to fast-reject an
@@ -967,7 +1196,7 @@ impl ArchiveExtractor {
                 });
             }
 
-            files.push(ArchiveEntry::File { path, data: contents });
+            files.push(ArchiveEntry::File { path, data: contents, mode, mtime });
         }
 
         Ok(files)

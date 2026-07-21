@@ -50,7 +50,7 @@
 //!
 //! // Process extracted files
 //! for entry in &files {
-//!     if let archive::ArchiveEntry::File { path, data } = entry {
+//!     if let archive::ArchiveEntry::File { path, data, .. } = entry {
 //!         println!("File: {} ({} bytes)", path, data.len());
 //!     }
 //! }
@@ -148,7 +148,7 @@
 //! # let data = vec![0u8; 100];
 //! match extractor.extract(&data, ArchiveFormat::Zip) {
 //!     Ok(files) => println!("Extracted {} files", files.len()),
-//!     Err(ArchiveError::FileTooLarge { size, limit }) => {
+//!     Err(ArchiveError::FileTooLarge { size, limit, .. }) => {
 //!         eprintln!("File too large: {} bytes (limit: {})", size, limit);
 //!     }
 //!     Err(e) => eprintln!("Extraction failed: {}", e),
