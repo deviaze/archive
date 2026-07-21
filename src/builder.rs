@@ -349,9 +349,10 @@ impl ArchiveBuilder {
                 ArchiveEntry::File { path, data, mode, mtime } => {
                     validate_path(path, self.allow_unsafe_path_traversals)?;
                     let mut header = ar::Header::new(path.clone().into_bytes(), data.len() as u64);
-                    if let Some(mode) = mode {
-                        header.set_mode(*mode);
-                    }
+                    // ar::Header::new defaults mode to 0, unlike the tar/zip paths which fall
+                    // back to a sane default when the entry doesn't carry one; without this,
+                    // an entry built without with_mode() round-trips as an unreadable 0-permission file.
+                    header.set_mode(mode.unwrap_or(0o644));
                     if let Some(secs) = Self::tar_mtime_secs(*mtime) {
                         header.set_mtime(secs);
                     }
