@@ -230,6 +230,7 @@ pub enum ArchiveEntry {
     /// A regular file with decompressed contents.
     File {
         /// The path of the file within the archive.
+        /// This is usually a filesystem path by convention, but can be any arbitrary string in practice.
         ///
         /// For multi-file archives (ZIP, TAR, 7-Zip), this is the path as
         /// stored in the archive. For single-file compression formats:
@@ -402,6 +403,22 @@ impl ArchiveEntry {
         }
     }
 
+    /// Changes the path of the current `ArchiveEntry` in place.
+    pub fn set_path(&mut self, p: impl AsRef<Path>) {
+        let p = path_to_archive_string(p.as_ref());
+        match self {
+            ArchiveEntry::Directory { path, .. } => {
+                *path = p
+            },
+            ArchiveEntry::File { path, .. } => {
+                *path = p
+            },
+            ArchiveEntry::Symlink { path, .. } => {
+                *path = p
+            }
+        }
+    }
+
     /// Returns the Unix permission bits (e.g. `0o644`) recorded for this
     /// entry, or `None` if the source format didn't record one (or this
     /// entry was constructed without [`ArchiveEntry::with_mode`]).
@@ -413,6 +430,15 @@ impl ArchiveEntry {
         }
     }
 
+    /// Sets the mode (unix mode) of this `ArchiveEntry` in place.
+    pub fn set_mode(&mut self, mode: u32) {
+        match self {
+            ArchiveEntry::File { mode: m, .. }
+            | ArchiveEntry::Directory { mode: m, .. }
+            | ArchiveEntry::Symlink { mode: m, .. } => *m = Some(mode),
+        }
+    }
+    
     /// Returns the last-modified time recorded for this entry, or `None` if
     /// the source format didn't record one (or this entry was constructed
     /// without [`ArchiveEntry::with_mtime`]).
@@ -421,6 +447,15 @@ impl ArchiveEntry {
             ArchiveEntry::File { mtime, .. } => *mtime,
             ArchiveEntry::Directory { mtime, .. } => *mtime,
             ArchiveEntry::Symlink { mtime, .. } => *mtime,
+        }
+    }
+
+    /// Sets the mtime of this ArchiveEntry in place.
+    pub fn set_mtime(&mut self, mtime: SystemTime) {
+        match self {
+            ArchiveEntry::File { mtime: t, .. }
+            | ArchiveEntry::Directory { mtime: t, .. }
+            | ArchiveEntry::Symlink { mtime: t, .. } => *t = Some(mtime),
         }
     }
 
@@ -580,6 +615,11 @@ impl ArchiveExtractor {
         self
     }
 
+    /// Sets the max file size in place, doesn't take the whole `self`.
+    pub fn set_max_file_size(&mut self, size: usize) {
+        self.max_file_size = size;
+    }
+
     /// Sets the maximum total size for all extracted files combined.
     ///
     /// This limit protects against zip bombs and archives with many files that
@@ -616,6 +656,11 @@ impl ArchiveExtractor {
         self
     }
 
+    /// Set max total size in place without taking whole `self`
+    pub fn set_max_total_size(&mut self, size: usize) {
+        self.max_total_size = size;
+    }
+
     /// Controls whether entry paths (and symlink targets) are allowed to
     /// contain `..` components or be absolute.
     ///
@@ -637,6 +682,14 @@ impl ArchiveExtractor {
     pub fn allow_unsafe_path_traversals(mut self, allow: bool) -> Self {
         self.allow_unsafe_path_traversals = allow;
         self
+    }
+
+    /// Controls whether entry paths (and symlink targets) are allowed to
+    /// contain `..` components or be absolute.
+    /// 
+    /// Is `false` by default; this version sets in place rather than taking the whole `self`.
+    pub fn set_allow_unsafe_path_traversals(&mut self, allow: bool) {
+        self.allow_unsafe_path_traversals = allow;
     }
 
     /// Extracts all files from an archive.
