@@ -474,6 +474,16 @@ impl ArchiveEntry {
         matches!(self, ArchiveEntry::Symlink { .. })
     }
 
+    /// Gets the `target` of the symlink if self is a symlink, otherwise returns `None`.
+    pub fn symlink_target(&self) -> Option<&str> {
+        match self {
+            ArchiveEntry::Symlink { target, .. } => {
+                Some(target)
+            },
+            _ => None
+        }
+    }
+
     /// Returns the file contents, or `None` if this entry isn't a [`ArchiveEntry::File`].
     pub fn data(&self) -> Option<&[u8]> {
         match self {
