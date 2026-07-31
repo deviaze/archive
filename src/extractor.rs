@@ -484,11 +484,35 @@ impl ArchiveEntry {
         }
     }
 
+    /// Sets the symlink target in place, panics if self isn't a symlink
+    pub fn set_symlink_target(&mut self, new_target: impl AsRef<Path>) {
+        match self {
+            Self::Symlink { target , .. } => {
+                *target = path_to_archive_string(new_target.as_ref())
+            },
+            other => {
+                panic!("set_symlink_target incorrectly called on non-symlink (got {:?})", other);
+            }
+        }
+    }
+
     /// Returns the file contents, or `None` if this entry isn't a [`ArchiveEntry::File`].
     pub fn data(&self) -> Option<&[u8]> {
         match self {
             ArchiveEntry::File { data, .. } => Some(data),
             _ => None,
+        }
+    }
+
+    /// Replaces the file contents in place, panics if self isn't a file
+    pub fn set_data(&mut self, new_data: Vec<u8>) {
+        match self {
+            ArchiveEntry::File { data, .. } => {
+                *data = new_data
+            },
+            other => {
+                panic!("set_data called on a non-file (got {:?})", other);
+            }
         }
     }
 }
