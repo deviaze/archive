@@ -1739,10 +1739,9 @@ impl ArchiveExtractor {
 
                 files.push(ArchiveEntry::Symlink { path, target, mode, mtime });
             } else if !is_directory {
-                // See the comment in extract_zip: the declared size is
-                // untrusted metadata, so it's only used to fast-reject an
-                // obviously-too-large claim here. The actual read below is
-                // bounded independently of what's declared.
+                // Unlike zip/7z, tar's entry reader is hard-capped by the
+                // container to exactly this many bytes, so this check is
+                // authoritative, not just a fast-reject.
                 let size = entry.size() as usize;
                 if size > self.max_file_size {
                     return Err(ArchiveError::FileTooLarge {
@@ -1793,10 +1792,9 @@ impl ArchiveExtractor {
             let mode = Some(entry.header().mode() & MODE_PERMISSION_MASK);
             let mtime = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(entry.header().mtime()));
 
-            // See the comment in extract_zip: the declared size is
-            // untrusted metadata, so it's only used to fast-reject an
-            // obviously-too-large claim here. The actual read below is
-            // bounded independently of what's declared.
+            // Unlike zip/7z, ar's entry reader is hard-capped by the
+            // container to exactly this many bytes, so this check is
+            // authoritative, not just a fast-reject.
             let size = entry.header().size() as usize;
             if size > self.max_file_size {
                 return Err(ArchiveError::FileTooLarge {
@@ -1860,12 +1858,13 @@ impl ArchiveExtractor {
                     is_dir: false,
                     is_symlink: true,
                     symlink_target: Some(target),
+                    size: None,
                 };
                 on_entry(&meta, &mut io::empty())?;
             } else if !is_directory {
-                // See the comment in extract_zip: the declared size is
-                // untrusted metadata, so it's only used to fast-reject an
-                // obviously-too-large claim here.
+                // Unlike zip/7z, tar's entry reader is hard-capped by the
+                // container to exactly this many bytes, so this check is
+                // authoritative, not just a fast-reject.
                 let size = entry.size() as usize;
                 if size > self.max_file_size {
                     return Err(ArchiveError::FileTooLarge {
@@ -1875,10 +1874,10 @@ impl ArchiveExtractor {
                     });
                 }
 
-                let meta = EntryMeta { path, mode, mtime, is_dir: false, is_symlink: false, symlink_target: None };
+                let meta = EntryMeta { path, mode, mtime, is_dir: false, is_symlink: false, symlink_target: None, size: Some(size as u64) };
                 self.stream_file_entry(meta, &mut entry, &mut total_size, on_entry)?;
             } else {
-                let meta = EntryMeta { path, mode, mtime, is_dir: true, is_symlink: false, symlink_target: None };
+                let meta = EntryMeta { path, mode, mtime, is_dir: true, is_symlink: false, symlink_target: None, size: None };
                 on_entry(&meta, &mut io::empty())?;
             }
         }
@@ -1901,9 +1900,9 @@ impl ArchiveExtractor {
             let mode = Some(entry.header().mode() & MODE_PERMISSION_MASK);
             let mtime = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(entry.header().mtime()));
 
-            // See the comment in extract_zip: the declared size is
-            // untrusted metadata, so it's only used to fast-reject an
-            // obviously-too-large claim here.
+            // Unlike zip/7z, ar's entry reader is hard-capped by the
+            // container to exactly this many bytes, so this check is
+            // authoritative, not just a fast-reject.
             let size = entry.header().size() as usize;
             if size > self.max_file_size {
                 return Err(ArchiveError::FileTooLarge {
@@ -1913,7 +1912,7 @@ impl ArchiveExtractor {
                 });
             }
 
-            let meta = EntryMeta { path, mode, mtime, is_dir: false, is_symlink: false, symlink_target: None };
+            let meta = EntryMeta { path, mode, mtime, is_dir: false, is_symlink: false, symlink_target: None, size: Some(size as u64) };
             self.stream_file_entry(meta, &mut entry, &mut total_size, on_entry)?;
         }
 
