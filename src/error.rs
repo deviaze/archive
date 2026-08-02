@@ -162,4 +162,18 @@ pub enum ArchiveError {
     /// The string contains the offending path.
     #[error("Unsafe archive entry path: {0}")]
     UnsafePath(String),
+
+    /// A [`crate::CompressionLevel`] passed to [`crate::ArchiveBuilder::compression_level`]
+    /// is invalid for the format being built.
+    ///
+    /// This covers two distinct cases:
+    /// - The variant doesn't apply to the target format (e.g.
+    ///   `CompressionLevel::Xz(6)` while building [`crate::ArchiveFormat::Zip`]).
+    /// - The variant applies, but its value is outside the range that
+    ///   format's backend accepts (e.g. `CompressionLevel::Bzip2(0)`, whose
+    ///   valid range is 1-9).
+    ///
+    /// The string describes which of these happened.
+    #[error("Invalid compression level: {0}")]
+    InvalidCompressionLevel(String),
 }

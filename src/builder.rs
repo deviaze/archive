@@ -4,24 +4,13 @@
 //! of [`ArchiveEntry`] values into the raw bytes of an archive. The main
 //! entry point is [`ArchiveBuilder`].
 
+use crate::compression::CompressionLevel;
 use crate::error::{ArchiveError, Result};
 use crate::extractor::ArchiveEntry;
 use crate::format::ArchiveFormat;
 use crate::path_safety::validate_path;
 use std::io::{Cursor, Write};
 use std::time::SystemTime;
-
-/// xz compression preset used when *writing* `.xz` and `.tar.xz`. 6 is what
-/// the `xz` CLI defaults to, and matches the "default" presets the other
-/// formats here are built with.
-///
-/// Encoding goes through `liblzma` rather than `lzma-rs` (which the extractor
-/// still decodes with) because `lzma-rs`' LZMA2 encoder only ever emits
-/// `uncompressed reset dict` chunks — it produces a valid xz stream that is
-/// *larger* than its input, so a `.tar.xz` built with it came out bigger than
-/// the plain `.tar`. `lzma-rs`' decoder is a real implementation, so it's kept
-/// for reading.
-const XZ_COMPRESSION_PRESET: u32 = 6;
 
 /// Builds archives in-memory from a list of [`ArchiveEntry`] values.
 ///
@@ -57,6 +46,7 @@ const XZ_COMPRESSION_PRESET: u32 = 6;
 #[derive(Debug, Clone, Default)]
 pub struct ArchiveBuilder {
     allow_unsafe_path_traversals: bool,
+    compression_level: CompressionLevel,
 }
 
 impl ArchiveBuilder {
@@ -92,6 +82,28 @@ impl ArchiveBuilder {
     /// ```
     pub fn allow_unsafe_path_traversals(mut self, allow: bool) -> Self {
         self.allow_unsafe_path_traversals = allow;
+        self
+    }
+
+    /// Sets the compression effort used when building the archive.
+    ///
+    /// [`CompressionLevel`] is format-specific: each variant (other than
+    /// [`CompressionLevel::Default`]) only applies to the archive format(s)
+    /// documented on it. Building with a variant that doesn't apply to the
+    /// target format, or whose value is out of range, fails with
+    /// [`ArchiveError::InvalidCompressionLevel`].
+    ///
+    /// This method uses the builder pattern, allowing you to chain configuration calls.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use archive::{ArchiveBuilder, CompressionLevel};
+    ///
+    /// let builder = ArchiveBuilder::new().compression_level(CompressionLevel::Xz(9));
+    /// ```
+    pub fn compression_level(mut self, level: CompressionLevel) -> Self {
+        self.compression_level = level;
         self
     }
 
@@ -191,13 +203,18 @@ impl ArchiveBuilder {
         }
     }
 
-    /// Builds the per-entry [`zip::write::FileOptions`] carrying `mode` and
-    /// `mtime`, if present. An `mtime` that predates 1980 or postdates 2107
-    /// (outside what zip's MS-DOS timestamp can represent) is silently
+    /// Layers per-entry `mode` and `mtime`, if present, onto a base
+    /// [`zip::write::FileOptions`] that already carries the builder's
+    /// compression settings. An `mtime` that predates 1980 or postdates
+    /// 2107 (outside what zip's MS-DOS timestamp can represent) is silently
     /// omitted rather than rejected — it's best-effort metadata, not
     /// something worth failing the whole build over.
-    fn zip_file_options(mode: Option<u32>, mtime: Option<SystemTime>) -> zip::write::FileOptions<'static, ()> {
-        let mut options = zip::write::FileOptions::default();
+    fn zip_file_options(
+        base: zip::write::FileOptions<'static, ()>,
+        mode: Option<u32>,
+        mtime: Option<SystemTime>,
+    ) -> zip::write::FileOptions<'static, ()> {
+        let mut options = base;
         if let Some(mode) = mode {
             options = options.unix_permissions(mode);
         }
@@ -209,24 +226,25 @@ impl ArchiveBuilder {
 
     fn build_zip(&self, entries: &[ArchiveEntry]) -> Result<Vec<u8>> {
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let base_options = self.compression_level.to_zip_options()?;
 
         for entry in entries {
             match entry {
                 ArchiveEntry::File { path, data, mode, mtime } => {
                     validate_path(path, self.allow_unsafe_path_traversals)?;
-                    let options = Self::zip_file_options(*mode, *mtime);
+                    let options = Self::zip_file_options(base_options, *mode, *mtime);
                     writer.start_file(path, options)?;
                     writer.write_all(data)?;
                 }
                 ArchiveEntry::Directory { path, mode, mtime } => {
                     validate_path(path, self.allow_unsafe_path_traversals)?;
-                    let options = Self::zip_file_options(*mode, *mtime);
+                    let options = Self::zip_file_options(base_options, *mode, *mtime);
                     writer.add_directory(path.clone(), options)?;
                 }
                 ArchiveEntry::Symlink { path, target, mode, mtime } => {
                     validate_path(path, self.allow_unsafe_path_traversals)?;
                     validate_path(target, self.allow_unsafe_path_traversals)?;
-                    let options = Self::zip_file_options(*mode, *mtime);
+                    let options = Self::zip_file_options(base_options, *mode, *mtime);
                     writer.add_symlink(path, target, options)?;
                 }
             }
@@ -304,29 +322,32 @@ impl ArchiveBuilder {
     }
 
     fn build_tar_gz(&self, entries: &[ArchiveEntry]) -> Result<Vec<u8>> {
-        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let level = self.compression_level.to_flate2(ArchiveFormat::TarGz)?;
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), level);
         let mut builder = tar::Builder::new(encoder);
         Self::write_tar_entries(&mut builder, entries, self.allow_unsafe_path_traversals)?;
         Ok(builder.into_inner()?.finish()?)
     }
 
     fn build_tar_bz2(&self, entries: &[ArchiveEntry]) -> Result<Vec<u8>> {
-        let encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        let level = self.compression_level.to_bzip2(ArchiveFormat::TarBz2)?;
+        let encoder = bzip2::write::BzEncoder::new(Vec::new(), level);
         let mut builder = tar::Builder::new(encoder);
         Self::write_tar_entries(&mut builder, entries, self.allow_unsafe_path_traversals)?;
         Ok(builder.into_inner()?.finish()?)
     }
 
     fn build_tar_zst(&self, entries: &[ArchiveEntry]) -> Result<Vec<u8>> {
-        // Level 0 asks zstd for its own default (currently 3).
-        let encoder = zstd::stream::write::Encoder::new(Vec::new(), 0)?;
+        let level = self.compression_level.to_zstd(ArchiveFormat::TarZst)?;
+        let encoder = zstd::stream::write::Encoder::new(Vec::new(), level)?;
         let mut builder = tar::Builder::new(encoder);
         Self::write_tar_entries(&mut builder, entries, self.allow_unsafe_path_traversals)?;
         Ok(builder.into_inner()?.finish()?)
     }
 
     fn build_tar_lz4(&self, entries: &[ArchiveEntry]) -> Result<Vec<u8>> {
-        let encoder = lz4::EncoderBuilder::new().build(Vec::new())?;
+        let level = self.compression_level.to_lz4(ArchiveFormat::TarLz4)?;
+        let encoder = lz4::EncoderBuilder::new().level(level).build(Vec::new())?;
         let mut builder = tar::Builder::new(encoder);
         Self::write_tar_entries(&mut builder, entries, self.allow_unsafe_path_traversals)?;
         let (buf, result) = builder.into_inner()?.finish();
@@ -334,8 +355,15 @@ impl ArchiveBuilder {
         Ok(buf)
     }
 
+    /// Encoding goes through `liblzma` rather than `lzma-rs` (which the
+    /// extractor still decodes with) because `lzma-rs`' LZMA2 encoder only
+    /// ever emits `uncompressed reset dict` chunks — it produces a valid xz
+    /// stream that is *larger* than its input, so a `.tar.xz` built with it
+    /// came out bigger than the plain `.tar`. `lzma-rs`' decoder is a real
+    /// implementation, so it's kept for reading.
     fn build_tar_xz(&self, entries: &[ArchiveEntry]) -> Result<Vec<u8>> {
-        let encoder = liblzma::write::XzEncoder::new(Vec::new(), XZ_COMPRESSION_PRESET);
+        let preset = self.compression_level.to_xz_preset(ArchiveFormat::TarXz)?;
+        let encoder = liblzma::write::XzEncoder::new(Vec::new(), preset);
         let mut builder = tar::Builder::new(encoder);
         Self::write_tar_entries(&mut builder, entries, self.allow_unsafe_path_traversals)?;
         Ok(builder.into_inner()?.finish()?)
@@ -474,28 +502,32 @@ impl ArchiveBuilder {
         {
             header = header.mtime(secs);
         }
-        let mut encoder = header.write(Vec::new(), flate2::Compression::default());
+        let level = self.compression_level.to_flate2(ArchiveFormat::Gz)?;
+        let mut encoder = header.write(Vec::new(), level);
         encoder.write_all(&data)?;
         Ok(encoder.finish()?)
     }
 
     fn build_single_bz2(&self, entries: &[ArchiveEntry]) -> Result<Vec<u8>> {
         let (_path, data, _mtime) = Self::single_file_entry(entries, self.allow_unsafe_path_traversals)?;
-        let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        let level = self.compression_level.to_bzip2(ArchiveFormat::Bz2)?;
+        let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), level);
         encoder.write_all(&data)?;
         Ok(encoder.finish()?)
     }
 
     fn build_single_xz(&self, entries: &[ArchiveEntry]) -> Result<Vec<u8>> {
         let (_path, data, _mtime) = Self::single_file_entry(entries, self.allow_unsafe_path_traversals)?;
-        let mut encoder = liblzma::write::XzEncoder::new(Vec::new(), XZ_COMPRESSION_PRESET);
+        let preset = self.compression_level.to_xz_preset(ArchiveFormat::Xz)?;
+        let mut encoder = liblzma::write::XzEncoder::new(Vec::new(), preset);
         encoder.write_all(&data)?;
         Ok(encoder.finish()?)
     }
 
     fn build_single_lz4(&self, entries: &[ArchiveEntry]) -> Result<Vec<u8>> {
         let (_path, data, _mtime) = Self::single_file_entry(entries, self.allow_unsafe_path_traversals)?;
-        let mut encoder = lz4::EncoderBuilder::new().build(Vec::new())?;
+        let level = self.compression_level.to_lz4(ArchiveFormat::Lz4)?;
+        let mut encoder = lz4::EncoderBuilder::new().level(level).build(Vec::new())?;
         encoder.write_all(&data)?;
         let (buf, result) = encoder.finish();
         result?;
@@ -504,7 +536,8 @@ impl ArchiveBuilder {
 
     fn build_single_zst(&self, entries: &[ArchiveEntry]) -> Result<Vec<u8>> {
         let (_path, data, _mtime) = Self::single_file_entry(entries, self.allow_unsafe_path_traversals)?;
-        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0)?;
+        let level = self.compression_level.to_zstd(ArchiveFormat::Zst)?;
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), level)?;
         encoder.write_all(&data)?;
         Ok(encoder.finish()?)
     }

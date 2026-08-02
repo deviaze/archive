@@ -1,6 +1,9 @@
 //! Tests for archive creation via `ArchiveBuilder`.
 
-use archive::{ArchiveBuilder, ArchiveEntry, ArchiveError, ArchiveExtractor, ArchiveFormat};
+use archive::{
+    ArchiveBuilder, ArchiveEntry, ArchiveError, ArchiveExtractor, ArchiveFormat, CompressionLevel,
+    ZipCompression,
+};
 
 /// Formats that support files, directories, and symlinks (everything but
 /// the single-file compressed formats, `.ar`/`.deb`, and `.7z`, which each
@@ -255,6 +258,101 @@ fn file_constructor_accepts_path_like_types() {
     assert_eq!(from_string.path(), "b.txt");
     assert_eq!(from_path.path(), "c.txt");
     assert_eq!(from_pathbuf.path(), "d.txt");
+}
+
+#[test]
+fn compression_level_round_trips_for_matching_formats() {
+    let cases = [
+        (ArchiveFormat::Zip, CompressionLevel::Zip(ZipCompression::Stored)),
+        (ArchiveFormat::Zip, CompressionLevel::Zip(ZipCompression::Deflated(9))),
+        (ArchiveFormat::Gz, CompressionLevel::Gzip(1)),
+        (ArchiveFormat::TarGz, CompressionLevel::Gzip(9)),
+        (ArchiveFormat::Bz2, CompressionLevel::Bzip2(1)),
+        (ArchiveFormat::TarBz2, CompressionLevel::Bzip2(9)),
+        (ArchiveFormat::Zst, CompressionLevel::Zstd(-5)),
+        (ArchiveFormat::TarZst, CompressionLevel::Zstd(19)),
+        (ArchiveFormat::Xz, CompressionLevel::Xz(0)),
+        (ArchiveFormat::TarXz, CompressionLevel::Xz(9)),
+        (ArchiveFormat::Lz4, CompressionLevel::Lz4(0)),
+        (ArchiveFormat::TarLz4, CompressionLevel::Lz4(16)),
+    ];
+
+    for (format, level) in cases {
+        let entries = vec![ArchiveEntry::file("hello.txt", b"Hello, World!".to_vec())];
+        let bytes = ArchiveBuilder::new()
+            .compression_level(level)
+            .build(&entries, format)
+            .unwrap_or_else(|e| panic!("{format:?} with {level:?} failed to build: {e}"));
+        let extracted = ArchiveExtractor::new().extract(&bytes, format).unwrap();
+
+        let hello = extracted.iter().find(|e| e.path() == "hello.txt");
+        let entry = if format.is_single_file() {
+            &extracted[0]
+        } else {
+            hello.unwrap_or_else(|| panic!("hello.txt missing for {format:?}: {extracted:?}"))
+        };
+        assert_eq!(
+            entry.data(),
+            Some(&b"Hello, World!"[..]),
+            "{format:?} with {level:?}"
+        );
+    }
+}
+
+#[test]
+fn compression_level_rejects_mismatched_format() {
+    let entries = vec![ArchiveEntry::file("hello.txt", b"Hello, World!".to_vec())];
+
+    let err = ArchiveBuilder::new()
+        .compression_level(CompressionLevel::Xz(6))
+        .build(&entries, ArchiveFormat::Zip)
+        .unwrap_err();
+    assert!(matches!(err, ArchiveError::InvalidCompressionLevel(_)), "{err:?}");
+
+    let err = ArchiveBuilder::new()
+        .compression_level(CompressionLevel::Gzip(6))
+        .build_single_file("hello.txt", b"data".to_vec(), ArchiveFormat::Bz2)
+        .unwrap_err();
+    assert!(matches!(err, ArchiveError::InvalidCompressionLevel(_)), "{err:?}");
+}
+
+#[test]
+fn compression_level_rejects_out_of_range_values() {
+    let entries = vec![ArchiveEntry::file("hello.txt", b"Hello, World!".to_vec())];
+
+    let cases = [
+        (ArchiveFormat::Gz, CompressionLevel::Gzip(10)),
+        (ArchiveFormat::Bz2, CompressionLevel::Bzip2(0)),
+        (ArchiveFormat::Bz2, CompressionLevel::Bzip2(10)),
+        (ArchiveFormat::Zst, CompressionLevel::Zstd(-8)),
+        (ArchiveFormat::Zst, CompressionLevel::Zstd(23)),
+        (ArchiveFormat::Xz, CompressionLevel::Xz(10)),
+        (ArchiveFormat::Lz4, CompressionLevel::Lz4(17)),
+        (ArchiveFormat::Zip, CompressionLevel::Zip(ZipCompression::Deflated(10))),
+    ];
+
+    for (format, level) in cases {
+        let err = ArchiveBuilder::new()
+            .compression_level(level)
+            .build(&entries, format)
+            .unwrap_err();
+        assert!(
+            matches!(err, ArchiveError::InvalidCompressionLevel(_)),
+            "{format:?} with {level:?}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn compression_level_default_applies_to_any_format() {
+    for &format in FULL_FEATURED_FORMATS {
+        round_trip(format);
+        let entries = vec![ArchiveEntry::file("hello.txt", b"Hello, World!".to_vec())];
+        ArchiveBuilder::new()
+            .compression_level(CompressionLevel::Default)
+            .build(&entries, format)
+            .unwrap_or_else(|e| panic!("{format:?} with Default level failed: {e}"));
+    }
 }
 
 #[test]

@@ -102,3 +102,80 @@ fn zst_decompression_bomb_is_rejected_without_full_buffering() {
         assert_bomb_rejected(&compressed, ArchiveFormat::Zst);
     }
 }
+
+/// Same bomb, but through `extract_streaming` instead of `extract`. The
+/// callback drains its reader itself (like a real caller piping to
+/// `io::copy`) and counts every byte it's actually handed. If streaming
+/// decompression fully materialized the bomb before checking its size —
+/// i.e. if it behaved just like `extract` internally and only checked
+/// after decompressing everything — this callback would see close to the
+/// full 200 MB before `extract_streaming` returned `FileTooLarge`. Instead
+/// it should be cut off within one read buffer's worth of the configured
+/// 100 MB `max_file_size` default.
+fn assert_streaming_bomb_rejected(compressed: &[u8], format: ArchiveFormat) {
+    assert!(
+        compressed.len() < 10 * 1024 * 1024,
+        "bomb wasn't actually small: {} bytes",
+        compressed.len()
+    );
+
+    let extractor = ArchiveExtractor::new(); // default max_file_size = 100MB
+    let mut bytes_seen: u64 = 0;
+
+    let err = extractor
+        .extract_streaming(compressed, format, |_meta, reader| {
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = reader.read(&mut buf).map_err(ArchiveError::Io)?;
+                if n == 0 {
+                    break;
+                }
+                bytes_seen += n as u64;
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+    assert!(matches!(err, ArchiveError::FileTooLarge { .. }), "{err:?}");
+    assert!(
+        bytes_seen <= 100 * 1024 * 1024 + 64 * 1024,
+        "streaming callback was handed {bytes_seen} bytes before the 100MB \
+         max_file_size limit tripped -- decompression wasn't actually cut \
+         off early"
+    );
+}
+
+#[test]
+fn xz_decompression_bomb_is_rejected_while_streaming() {
+    if let Some(compressed) = compress_zeros_with("xz", &["-0", "-c"]) {
+        assert_streaming_bomb_rejected(&compressed, ArchiveFormat::Xz);
+    }
+}
+
+#[test]
+fn gz_decompression_bomb_is_rejected_while_streaming() {
+    if let Some(compressed) = compress_zeros_with("gzip", &["-1", "-c"]) {
+        assert_streaming_bomb_rejected(&compressed, ArchiveFormat::Gz);
+    }
+}
+
+#[test]
+fn bz2_decompression_bomb_is_rejected_while_streaming() {
+    if let Some(compressed) = compress_zeros_with("bzip2", &["-1", "-c"]) {
+        assert_streaming_bomb_rejected(&compressed, ArchiveFormat::Bz2);
+    }
+}
+
+#[test]
+fn lz4_decompression_bomb_is_rejected_while_streaming() {
+    if let Some(compressed) = compress_zeros_with("lz4", &["-1", "-c"]) {
+        assert_streaming_bomb_rejected(&compressed, ArchiveFormat::Lz4);
+    }
+}
+
+#[test]
+fn zst_decompression_bomb_is_rejected_while_streaming() {
+    if let Some(compressed) = compress_zeros_with("zstd", &["-1", "-c"]) {
+        assert_streaming_bomb_rejected(&compressed, ArchiveFormat::Zst);
+    }
+}

@@ -157,12 +157,14 @@
 //! ```
 
 pub mod builder;
+pub mod compression;
 pub mod error;
 pub mod extractor;
 pub mod format;
 pub mod path_safety;
 
 pub use builder::ArchiveBuilder;
+pub use compression::{CompressionLevel, ZipCompression};
 pub use error::{ArchiveError, Result};
-pub use extractor::{ArchiveEntry, ArchiveExtractor};
+pub use extractor::{ArchiveEntry, ArchiveExtractor, EntryMeta};
 pub use format::ArchiveFormat;

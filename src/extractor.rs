@@ -7,7 +7,7 @@
 use crate::error::{ArchiveError, Result};
 use crate::format::ArchiveFormat;
 use crate::path_safety::validate_path;
-use std::io::{Cursor, Read, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -178,6 +178,146 @@ impl Write for BoundedWriter<'_> {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// Which limit a [`LimitedReader`] tripped, so
+/// [`ArchiveExtractor::extract_streaming`] can report the precise
+/// [`ArchiveError`] once the caller's callback returns, instead of losing it
+/// behind whatever generic I/O error the callback's own `io::copy` (or
+/// similar) turned the read failure into.
+enum LimitTrip {
+    File,
+    Total,
+}
+
+/// Wraps a per-entry decompressing reader passed to an
+/// [`ArchiveExtractor::extract_streaming`] callback, enforcing
+/// `max_file_size` and `max_total_size` against bytes as they're actually
+/// pulled through the reader. Unlike [`bounded_read_to_end`], nothing is
+/// buffered first — the whole point of streaming extraction is that a
+/// caller can hand bytes straight to their destination (e.g. a `fs::File`
+/// via `io::copy`) without materializing the entry in memory.
+///
+/// `total_seen` is threaded through by mutable reference rather than owned,
+/// since it accumulates across every entry in one `extract_streaming` call,
+/// not just this one.
+struct LimitedReader<'a, R: Read> {
+    inner: R,
+    file_limit: usize,
+    file_seen: usize,
+    total_seen: &'a mut usize,
+    total_limit: usize,
+    trip: Option<LimitTrip>,
+}
+
+impl<'a, R: Read> LimitedReader<'a, R> {
+    fn new(inner: R, file_limit: usize, total_seen: &'a mut usize, total_limit: usize) -> Self {
+        Self {
+            inner,
+            file_limit,
+            file_seen: 0,
+            total_seen,
+            total_limit,
+            trip: None,
+        }
+    }
+
+    /// Converts a trip recorded while reading into the matching
+    /// [`ArchiveError`], if one occurred. Called after the driving callback
+    /// returns, so a size violation always wins over whatever generic I/O
+    /// error the callback turned the underlying read failure into.
+    fn into_result(self, path: &str, result: Result<()>) -> Result<()> {
+        match self.trip {
+            Some(LimitTrip::File) => Err(ArchiveError::FileTooLarge {
+                path: Some(path.to_string()),
+                size: self.file_seen,
+                limit: self.file_limit,
+            }),
+            Some(LimitTrip::Total) => Err(ArchiveError::TotalSizeTooLarge {
+                size: *self.total_seen,
+                limit: self.total_limit,
+            }),
+            None => result,
+        }
+    }
+}
+
+impl<R: Read> Read for LimitedReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.file_seen += n;
+        if self.file_seen > self.file_limit {
+            self.trip = Some(LimitTrip::File);
+            return Err(io::Error::other(
+                "archive entry exceeds configured max_file_size",
+            ));
+        }
+        *self.total_seen += n;
+        if *self.total_seen > self.total_limit {
+            self.trip = Some(LimitTrip::Total);
+            return Err(io::Error::other(
+                "archive extraction exceeds configured max_total_size",
+            ));
+        }
+        Ok(n)
+    }
+}
+
+/// Metadata for an entry produced by [`ArchiveExtractor::extract_streaming`],
+/// without its contents. For a file entry, the contents are exposed to the
+/// callback via a live `&mut dyn Read` passed alongside this value, instead
+/// of being buffered into memory first — a caller that just wants to write
+/// entries to disk can `io::copy` straight from it into a `fs::File`,
+/// without ever materializing more than one `io::copy` buffer's worth of
+/// any single entry in memory.
+///
+/// Directory and symlink entries carry no content of their own (a symlink's
+/// target is metadata, in `symlink_target`), so the callback receives an
+/// empty reader for those.
+#[derive(Debug, Clone)]
+pub struct EntryMeta {
+    /// The path of the entry within the archive.
+    pub path: String,
+    /// The Unix permission bits (e.g. `0o644`), if the source format
+    /// records them.
+    pub mode: Option<u32>,
+    /// The last-modified time, if the source format records one.
+    pub mtime: Option<SystemTime>,
+    /// Whether this entry is a directory.
+    pub is_dir: bool,
+    /// Whether this entry is a symlink (or, for tar, a hard link).
+    pub is_symlink: bool,
+    /// The link target, if `is_symlink` is `true`. Already validated the
+    /// same way [`ArchiveExtractor::extract`] validates symlink targets.
+    pub symlink_target: Option<String>,
+    /// The entry's uncompressed size in bytes, for formats where the
+    /// container structurally guarantees this matches what you'll actually
+    /// read: `.tar`-family and `.ar`/`.deb` entries are read through a
+    /// reader hard-capped at exactly this many bytes by the container
+    /// format itself, so a malicious archive can't make one produce more
+    /// than it declares here.
+    ///
+    /// `None` for directories and symlinks (no content). Also `None` for
+    /// every entry in zip, 7z, and the single-file formats — their
+    /// declared/metadata size is *not* structurally enforced (a crafted
+    /// deflate or LZMA stream can keep producing bytes past what the
+    /// header claims), so this crate treats it as untrusted and doesn't
+    /// surface it here. If you need a verified size for those formats,
+    /// count the bytes your callback actually reads.
+    pub size: Option<u64>,
+}
+
+impl EntryMeta {
+    /// Returns `true` if this entry is a regular file (neither a directory
+    /// nor a symlink).
+    pub fn is_file(&self) -> bool {
+        !self.is_dir && !self.is_symlink
+    }
+
+    /// Returns the symlink target, or `None` if this entry isn't a symlink.
+    pub fn symlink_target(&self) -> Option<&str> {
+        self.symlink_target.as_deref()
     }
 }
 
@@ -835,6 +975,401 @@ impl ArchiveExtractor {
         }
     }
 
+    /// Extracts an archive without materializing its entries in memory.
+    ///
+    /// This is the streaming counterpart to [`Self::extract`]: instead of
+    /// decompressing every entry into an owned `Vec<u8>` and collecting them
+    /// all into one `Vec<ArchiveEntry>`, `on_entry` is called once per entry
+    /// with its metadata and a live `&mut dyn Read` the callback can drive
+    /// directly — e.g. via `io::copy` into a `fs::File`. Nothing beyond the
+    /// current entry (and, for the `.xz` formats, the underlying decoder's
+    /// own working state) is ever resident in memory at once.
+    ///
+    /// `max_file_size` and `max_total_size` are still enforced, against the
+    /// real bytes read through the callback's reader as they're produced
+    /// rather than against a fully-buffered entry — so a callback that
+    /// doesn't read an entry to completion only counts the bytes it actually
+    /// consumed. Directory and symlink entries carry no content of their own
+    /// (see [`EntryMeta`]), so `on_entry` receives an empty reader for those.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::extract`] ([`ArchiveError::FileTooLarge`],
+    /// [`ArchiveError::TotalSizeTooLarge`], [`ArchiveError::UnsafePath`],
+    /// [`ArchiveError::InvalidArchive`], [`ArchiveError::Io`],
+    /// [`ArchiveError::Zip`]), plus whatever error `on_entry` itself returns.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use archive::{ArchiveExtractor, ArchiveFormat};
+    /// use std::fs;
+    /// use std::io;
+    /// use std::path::Path;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let data = fs::read("archive.zip")?;
+    /// let extractor = ArchiveExtractor::new();
+    /// let root = Path::new("/tmp/extracted");
+    ///
+    /// extractor.extract_streaming(&data, ArchiveFormat::Zip, |meta, reader| {
+    ///     let dest = root.join(&meta.path);
+    ///     if meta.is_dir {
+    ///         fs::create_dir_all(&dest)?;
+    ///     } else if meta.is_symlink {
+    ///         // meta.symlink_target() has the link target; create it with
+    ///         // your platform's symlink call after re-validating it against
+    ///         // `root`.
+    ///     } else {
+    ///         if let Some(parent) = dest.parent() {
+    ///             fs::create_dir_all(parent)?;
+    ///         }
+    ///         let mut file = fs::File::create(&dest)?;
+    ///         io::copy(reader, &mut file)?;
+    ///     }
+    ///     Ok(())
+    /// })?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn extract_streaming<F>(&self, data: &[u8], format: ArchiveFormat, mut on_entry: F) -> Result<()>
+    where
+        F: FnMut(&EntryMeta, &mut dyn Read) -> Result<()>,
+    {
+        match format {
+            ArchiveFormat::Zip => self.extract_zip_streaming(data, &mut on_entry),
+            ArchiveFormat::Tar => {
+                let cursor = Cursor::new(data);
+                let mut archive = tar::Archive::new(cursor);
+                self.process_tar_entries_streaming(&mut archive, &mut on_entry)
+            }
+            ArchiveFormat::Ar => {
+                let cursor = Cursor::new(data);
+                let mut archive = ar::Archive::new(cursor);
+                self.process_ar_entries_streaming(&mut archive, &mut on_entry)
+            }
+            ArchiveFormat::Deb => {
+                let cursor = Cursor::new(data);
+                let mut archive = ar::Archive::new(cursor);
+                self.process_ar_entries_streaming(&mut archive, &mut on_entry)
+            }
+            ArchiveFormat::TarGz => {
+                let cursor = Cursor::new(data);
+                let decoder = flate2::read::GzDecoder::new(cursor);
+                let mut archive = tar::Archive::new(decoder);
+                self.process_tar_entries_streaming(&mut archive, &mut on_entry)
+            }
+            ArchiveFormat::TarBz2 => {
+                let cursor = Cursor::new(data);
+                let decoder = bzip2::read::BzDecoder::new(cursor);
+                let mut archive = tar::Archive::new(decoder);
+                self.process_tar_entries_streaming(&mut archive, &mut on_entry)
+            }
+            ArchiveFormat::TarXz => {
+                let cursor = Cursor::new(data);
+                let decoder = liblzma::read::XzDecoder::new(cursor);
+                let mut archive = tar::Archive::new(decoder);
+                self.process_tar_entries_streaming(&mut archive, &mut on_entry)
+            }
+            ArchiveFormat::TarZst => {
+                let cursor = Cursor::new(data);
+                let decoder = zstd::stream::read::Decoder::new(cursor)?;
+                let mut archive = tar::Archive::new(decoder);
+                self.process_tar_entries_streaming(&mut archive, &mut on_entry)
+            }
+            ArchiveFormat::TarLz4 => {
+                let cursor = Cursor::new(data);
+                let decoder = lz4::Decoder::new(cursor)?;
+                let mut archive = tar::Archive::new(decoder);
+                self.process_tar_entries_streaming(&mut archive, &mut on_entry)
+            }
+            ArchiveFormat::SevenZ => self.extract_7z_streaming(data, &mut on_entry),
+            ArchiveFormat::Gz => self.extract_single_gz_streaming(data, &mut on_entry),
+            ArchiveFormat::Bz2 => self.extract_single_bz2_streaming(data, &mut on_entry),
+            ArchiveFormat::Xz => self.extract_single_xz_streaming(data, &mut on_entry),
+            ArchiveFormat::Lz4 => self.extract_single_lz4_streaming(data, &mut on_entry),
+            ArchiveFormat::Zst => self.extract_single_zst_streaming(data, &mut on_entry),
+        }
+    }
+
+    /// Drives `on_entry` for a single file entry through a
+    /// [`LimitedReader`], translating a tripped limit into the matching
+    /// [`ArchiveError`] afterward. Shared by every streaming format's file
+    /// branch.
+    fn stream_file_entry<R: Read, F: FnMut(&EntryMeta, &mut dyn Read) -> Result<()>>(
+        &self,
+        meta: EntryMeta,
+        reader: R,
+        total_size: &mut usize,
+        on_entry: &mut F,
+    ) -> Result<()> {
+        let mut limited = LimitedReader::new(reader, self.max_file_size, total_size, self.max_total_size);
+        let result = on_entry(&meta, &mut limited);
+        limited.into_result(&meta.path, result)
+    }
+
+    fn extract_zip_streaming<F>(&self, data: &[u8], on_entry: &mut F) -> Result<()>
+    where
+        F: FnMut(&EntryMeta, &mut dyn Read) -> Result<()>,
+    {
+        let reader = Cursor::new(data);
+        let mut archive = zip::ZipArchive::new(reader)?;
+        let mut total_size = 0usize;
+
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i)?;
+            let is_directory = file.is_dir();
+            let path = file.name().to_string();
+            validate_path(&path, self.allow_unsafe_path_traversals)?;
+
+            let is_symlink = file
+                .unix_mode()
+                .is_some_and(|mode| mode & S_IFMT == S_IFLNK);
+            let mode = file.unix_mode().map(|mode| mode & MODE_PERMISSION_MASK);
+            let mtime = file.last_modified().map(zip_datetime_to_system_time);
+
+            if is_directory {
+                let meta = EntryMeta { path, mode, mtime, is_dir: true, is_symlink: false, symlink_target: None, size: None };
+                on_entry(&meta, &mut io::empty())?;
+                continue;
+            }
+
+            // See the comment in extract_zip: the declared size is
+            // untrusted metadata, so it's only used to fast-reject an
+            // obviously-too-large claim here.
+            let size = file.size() as usize;
+            if size > self.max_file_size {
+                return Err(ArchiveError::FileTooLarge {
+                    path: Some(path),
+                    size,
+                    limit: self.max_file_size,
+                });
+            }
+
+            if is_symlink {
+                // A zip symlink's target is stored as the "file" contents,
+                // and is always tiny, so it's read fully up front rather
+                // than streamed like a regular file's data would be.
+                let mut contents = Vec::new();
+                reserve_exact(&mut contents, size)?;
+                bounded_read_to_end(&mut file, &mut contents, self.max_file_size, Some(&path))?;
+
+                total_size += contents.len();
+                if total_size > self.max_total_size {
+                    return Err(ArchiveError::TotalSizeTooLarge {
+                        size: total_size,
+                        limit: self.max_total_size,
+                    });
+                }
+
+                let target = String::from_utf8_lossy(&contents).into_owned();
+                validate_path(&target, self.allow_unsafe_path_traversals)?;
+                let meta = EntryMeta {
+                    path,
+                    mode,
+                    mtime,
+                    is_dir: false,
+                    is_symlink: true,
+                    symlink_target: Some(target),
+                    size: None,
+                };
+                on_entry(&meta, &mut io::empty())?;
+            } else {
+                let meta = EntryMeta { path, mode, mtime, is_dir: false, is_symlink: false, symlink_target: None, size: None };
+                self.stream_file_entry(meta, &mut file, &mut total_size, on_entry)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn extract_7z_streaming<F>(&self, data: &[u8], on_entry: &mut F) -> Result<()>
+    where
+        F: FnMut(&EntryMeta, &mut dyn Read) -> Result<()>,
+    {
+        let mut cursor = Cursor::new(data);
+        let len = cursor.get_ref().len() as u64;
+
+        let mut archive = sevenz_rust::SevenZReader::new(&mut cursor, len, "".into())
+            .map_err(|e| ArchiveError::InvalidArchive(format!("7z error: {}", e)))?;
+
+        let mut total_size = 0usize;
+        let mut early_error: Option<ArchiveError> = None;
+
+        let result = archive.for_each_entries(|entry, reader| {
+            let path = entry.name();
+            if let Err(e) = validate_path(path, self.allow_unsafe_path_traversals) {
+                early_error = Some(e);
+                return Ok(false);
+            }
+
+            let mode = (entry.has_windows_attributes
+                && entry.windows_attributes & SEVENZ_UNIX_EXTENSION_FLAG != 0)
+                .then_some((entry.windows_attributes >> 16) & MODE_PERMISSION_MASK);
+            let mtime = entry
+                .has_last_modified_date
+                .then(|| SystemTime::from(entry.last_modified_date()));
+
+            if entry.is_directory() {
+                let meta = EntryMeta {
+                    path: path.to_string(),
+                    mode,
+                    mtime,
+                    is_dir: true,
+                    is_symlink: false,
+                    symlink_target: None,
+                    size: None,
+                };
+                if let Err(e) = on_entry(&meta, &mut io::empty()) {
+                    early_error = Some(e);
+                    return Ok(false);
+                }
+                return Ok(true);
+            }
+
+            // See the comment in extract_zip: the declared size is
+            // untrusted metadata, so it's only used to fast-reject an
+            // obviously-too-large claim here.
+            let size = entry.size() as usize;
+            if size > self.max_file_size {
+                early_error = Some(ArchiveError::FileTooLarge {
+                    path: Some(path.to_string()),
+                    size,
+                    limit: self.max_file_size,
+                });
+                return Ok(false);
+            }
+
+            let meta = EntryMeta {
+                path: path.to_string(),
+                mode,
+                mtime,
+                is_dir: false,
+                is_symlink: false,
+                symlink_target: None,
+                size: None,
+            };
+            if let Err(e) = self.stream_file_entry(meta, reader, &mut total_size, on_entry) {
+                early_error = Some(e);
+                return Ok(false);
+            }
+
+            Ok(true)
+        });
+
+        if let Some(err) = early_error {
+            return Err(err);
+        }
+
+        result.map_err(|e| ArchiveError::InvalidArchive(format!("7z extraction error: {}", e)))?;
+
+        Ok(())
+    }
+
+    // Single-file streaming decompression methods
+
+    fn extract_single_gz_streaming<F>(&self, data: &[u8], on_entry: &mut F) -> Result<()>
+    where
+        F: FnMut(&EntryMeta, &mut dyn Read) -> Result<()>,
+    {
+        let header_cursor = Cursor::new(data);
+        let header_decoder = flate2::read::GzDecoder::new(header_cursor);
+        let path = header_decoder
+            .header()
+            .and_then(|h| h.filename())
+            .and_then(|f| std::str::from_utf8(f).ok())
+            .filter(|f| validate_path(f, self.allow_unsafe_path_traversals).is_ok())
+            .unwrap_or("data")
+            .to_string();
+        let mtime = header_decoder
+            .header()
+            .map(|h| h.mtime())
+            .filter(|&secs| secs != 0)
+            .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64));
+
+        let cursor = Cursor::new(data);
+        let decoder = flate2::read::GzDecoder::new(cursor);
+        let meta = EntryMeta { path, mode: None, mtime, is_dir: false, is_symlink: false, symlink_target: None, size: None };
+        let mut total_size = 0usize;
+        self.stream_file_entry(meta, decoder, &mut total_size, on_entry)
+    }
+
+    fn extract_single_bz2_streaming<F>(&self, data: &[u8], on_entry: &mut F) -> Result<()>
+    where
+        F: FnMut(&EntryMeta, &mut dyn Read) -> Result<()>,
+    {
+        let cursor = Cursor::new(data);
+        let decoder = bzip2::read::BzDecoder::new(cursor);
+        let meta = EntryMeta {
+            path: "data".to_string(),
+            mode: None,
+            mtime: None,
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            size: None,
+        };
+        let mut total_size = 0usize;
+        self.stream_file_entry(meta, decoder, &mut total_size, on_entry)
+    }
+
+    fn extract_single_xz_streaming<F>(&self, data: &[u8], on_entry: &mut F) -> Result<()>
+    where
+        F: FnMut(&EntryMeta, &mut dyn Read) -> Result<()>,
+    {
+        let cursor = Cursor::new(data);
+        let decoder = liblzma::read::XzDecoder::new(cursor);
+        let meta = EntryMeta {
+            path: "data".to_string(),
+            mode: None,
+            mtime: None,
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            size: None,
+        };
+        let mut total_size = 0usize;
+        self.stream_file_entry(meta, decoder, &mut total_size, on_entry)
+    }
+
+    fn extract_single_lz4_streaming<F>(&self, data: &[u8], on_entry: &mut F) -> Result<()>
+    where
+        F: FnMut(&EntryMeta, &mut dyn Read) -> Result<()>,
+    {
+        let cursor = Cursor::new(data);
+        let decoder = lz4::Decoder::new(cursor)?;
+        let meta = EntryMeta {
+            path: "data".to_string(),
+            mode: None,
+            mtime: None,
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            size: None,
+        };
+        let mut total_size = 0usize;
+        self.stream_file_entry(meta, decoder, &mut total_size, on_entry)
+    }
+
+    fn extract_single_zst_streaming<F>(&self, data: &[u8], on_entry: &mut F) -> Result<()>
+    where
+        F: FnMut(&EntryMeta, &mut dyn Read) -> Result<()>,
+    {
+        let cursor = Cursor::new(data);
+        let decoder = zstd::stream::read::Decoder::new(cursor)?;
+        let meta = EntryMeta {
+            path: "data".to_string(),
+            mode: None,
+            mtime: None,
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            size: None,
+        };
+        let mut total_size = 0usize;
+        self.stream_file_entry(meta, decoder, &mut total_size, on_entry)
+    }
+
     fn extract_zip(&self, data: &[u8]) -> Result<Vec<ArchiveEntry>> {
         let reader = Cursor::new(data);
         let mut archive = zip::ZipArchive::new(reader)?;
@@ -1287,6 +1822,102 @@ impl ArchiveExtractor {
         }
 
         Ok(files)
+    }
+
+    fn process_tar_entries_streaming<R: Read, F: FnMut(&EntryMeta, &mut dyn Read) -> Result<()>>(
+        &self,
+        archive: &mut tar::Archive<R>,
+        on_entry: &mut F,
+    ) -> Result<()> {
+        let mut total_size = 0usize;
+
+        for entry_result in archive.entries()? {
+            let mut entry = entry_result?;
+            let path = entry.path()?.to_string_lossy().to_string();
+            validate_path(&path, self.allow_unsafe_path_traversals)?;
+
+            let entry_type = entry.header().entry_type();
+            let is_directory = entry_type.is_dir();
+            let is_symlink = entry_type.is_symlink() || entry_type.is_hard_link();
+            let mode = entry.header().mode().ok().map(|mode| mode & MODE_PERMISSION_MASK);
+            let mtime = entry
+                .header()
+                .mtime()
+                .ok()
+                .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
+
+            if is_symlink {
+                let target = entry
+                    .link_name()?
+                    .map(|t| t.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                validate_path(&target, self.allow_unsafe_path_traversals)?;
+
+                let meta = EntryMeta {
+                    path,
+                    mode,
+                    mtime,
+                    is_dir: false,
+                    is_symlink: true,
+                    symlink_target: Some(target),
+                };
+                on_entry(&meta, &mut io::empty())?;
+            } else if !is_directory {
+                // See the comment in extract_zip: the declared size is
+                // untrusted metadata, so it's only used to fast-reject an
+                // obviously-too-large claim here.
+                let size = entry.size() as usize;
+                if size > self.max_file_size {
+                    return Err(ArchiveError::FileTooLarge {
+                        path: Some(path),
+                        size,
+                        limit: self.max_file_size,
+                    });
+                }
+
+                let meta = EntryMeta { path, mode, mtime, is_dir: false, is_symlink: false, symlink_target: None };
+                self.stream_file_entry(meta, &mut entry, &mut total_size, on_entry)?;
+            } else {
+                let meta = EntryMeta { path, mode, mtime, is_dir: true, is_symlink: false, symlink_target: None };
+                on_entry(&meta, &mut io::empty())?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn process_ar_entries_streaming<R: Read, F: FnMut(&EntryMeta, &mut dyn Read) -> Result<()>>(
+        &self,
+        archive: &mut ar::Archive<R>,
+        on_entry: &mut F,
+    ) -> Result<()> {
+        let mut total_size = 0usize;
+
+        while let Some(entry_result) = archive.next_entry() {
+            let mut entry = entry_result?;
+            let path = String::from_utf8_lossy(entry.header().identifier()).to_string();
+            validate_path(&path, self.allow_unsafe_path_traversals)?;
+
+            let mode = Some(entry.header().mode() & MODE_PERMISSION_MASK);
+            let mtime = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(entry.header().mtime()));
+
+            // See the comment in extract_zip: the declared size is
+            // untrusted metadata, so it's only used to fast-reject an
+            // obviously-too-large claim here.
+            let size = entry.header().size() as usize;
+            if size > self.max_file_size {
+                return Err(ArchiveError::FileTooLarge {
+                    path: Some(path),
+                    size,
+                    limit: self.max_file_size,
+                });
+            }
+
+            let meta = EntryMeta { path, mode, mtime, is_dir: false, is_symlink: false, symlink_target: None };
+            self.stream_file_entry(meta, &mut entry, &mut total_size, on_entry)?;
+        }
+
+        Ok(())
     }
 }
 
