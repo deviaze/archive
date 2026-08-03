@@ -1,5 +1,7 @@
 //! Per-format compression level configuration for [`crate::ArchiveBuilder`].
 
+use std::fmt;
+
 use crate::error::{ArchiveError, Result};
 use crate::format::ArchiveFormat;
 
@@ -70,6 +72,34 @@ pub enum CompressionLevel {
 }
 
 impl CompressionLevel {
+    /// The variant's name, e.g. `"Gzip"` or `"Default"`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::Zip(_) => "Zip",
+            Self::Gzip(_) => "Gzip",
+            Self::Bzip2(_) => "Bzip2",
+            Self::Zstd(_) => "Zstd",
+            Self::Xz(_) => "Xz",
+            Self::Lz4(_) => "Lz4",
+        }
+    }
+
+    /// The numeric level carried by the variant, if any. `None` for
+    /// [`Self::Default`] and [`ZipCompression::Stored`], which have no level
+    /// of their own.
+    pub fn level(self) -> Option<i64> {
+        match self {
+            Self::Default => None,
+            Self::Zip(ZipCompression::Stored) => None,
+            Self::Zip(ZipCompression::Deflated(level)) => Some(level as i64),
+            Self::Gzip(level) | Self::Bzip2(level) | Self::Xz(level) | Self::Lz4(level) => {
+                Some(level as i64)
+            }
+            Self::Zstd(level) => Some(level as i64),
+        }
+    }
+
     fn mismatch(self, format: ArchiveFormat) -> ArchiveError {
         ArchiveError::InvalidCompressionLevel(format!(
             "{self:?} does not apply to {} archives",
@@ -144,6 +174,15 @@ impl CompressionLevel {
                 .compression_level(Some(level as i64))),
             Self::Zip(ZipCompression::Deflated(_)) => Err(self.out_of_range("0..=9")),
             _ => Err(self.mismatch(ArchiveFormat::Zip)),
+        }
+    }
+}
+
+impl fmt::Display for CompressionLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.level() {
+            Some(level) => write!(f, "{} ({level})", self.name()),
+            None => write!(f, "{}", self.name()),
         }
     }
 }
