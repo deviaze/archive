@@ -163,7 +163,8 @@ impl CompressionLevel {
     /// method/level, shared by every entry in the archive. Per-entry mode
     /// and mtime are layered on top by the caller.
     pub(crate) fn to_zip_options(self) -> Result<zip::write::FileOptions<'static, 'static, ()>> {
-        let options = zip::write::FileOptions::default();
+        // zip 9 marks entries as made by DOS when built on Windows, which drops their unix mode
+        let options = zip::write::FileOptions::default().system(zip::System::Unix);
         match self {
             Self::Default => Ok(options),
             Self::Zip(ZipCompression::Stored) => {
