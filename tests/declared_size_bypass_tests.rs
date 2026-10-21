@@ -7,7 +7,9 @@
 //!
 //! This crafts such a zip by hand (the `zip` crate's own writer always
 //! computes an honest size, so it can't be used to build the malicious
-//! case) and confirms extraction is now rejected via `FileTooLarge`.
+//! case) and confirms extraction is rejected. Since zip 9 the `zip` crate
+//! itself refuses to read past the declared size, which we report as
+//! `InvalidArchive` instead of leaking its raw `io::Error`.
 
 use archive::{ArchiveError, ArchiveExtractor, ArchiveFormat};
 use flate2::write::DeflateEncoder;
@@ -87,7 +89,24 @@ fn zip_lying_declared_size_is_rejected_via_actual_bytes_read() {
     // Well above the lie (100 bytes), well below the real size (50MB).
     let extractor = ArchiveExtractor::new().with_max_file_size(10 * 1024 * 1024);
     let err = extractor.extract(&zip, ArchiveFormat::Zip).unwrap_err();
-    assert!(matches!(err, ArchiveError::FileTooLarge { .. }), "{err:?}");
+    assert!(matches!(err, ArchiveError::InvalidArchive(_)), "{err:?}");
+}
+
+#[test]
+fn zip_lying_declared_size_is_rejected_while_streaming() {
+    let real_data = vec![0u8; 50 * 1024 * 1024];
+    let zip = build_zip_with_lying_size("lie.txt", &real_data, 100);
+
+    // The callback turns the read failure into its own error, the way a caller
+    // that `io::copy`s into a file would; the extractor still reports InvalidArchive.
+    let extractor = ArchiveExtractor::new().with_max_file_size(10 * 1024 * 1024);
+    let err = extractor
+        .extract_streaming(&zip, ArchiveFormat::Zip, |_meta, reader| {
+            std::io::copy(reader, &mut std::io::sink())?;
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(matches!(err, ArchiveError::InvalidArchive(_)), "{err:?}");
 }
 
 #[test]

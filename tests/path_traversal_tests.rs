@@ -116,7 +116,7 @@ fn zip_rejects_parent_dir_traversal_path() {
     let mut buf = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buf);
-        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
         writer.start_file("../../etc/passwd", options).unwrap();
         writer.write_all(b"pwned").unwrap();
         writer.finish().unwrap();
@@ -133,7 +133,7 @@ fn zip_accepts_normal_archive() {
     let mut buf = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buf);
-        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
         writer.start_file("safe/file.txt", options).unwrap();
         writer.write_all(b"hello world").unwrap();
         writer.finish().unwrap();

@@ -264,6 +264,40 @@ impl<R: Read> Read for LimitedReader<'_, R> {
     }
 }
 
+/// Wraps a zip entry's reader to remember the `InvalidData` error zip raises
+/// when an entry decompresses past its declared size or fails its CRC check.
+/// Like [`LimitedReader`], the error is recorded rather than read back from
+/// the result because a streaming callback may wrap it in its own error.
+struct ZipEntryReader<R: Read> {
+    inner: R,
+    invalid: Option<String>,
+}
+
+impl<R: Read> ZipEntryReader<R> {
+    fn new(inner: R) -> Self {
+        Self { inner, invalid: None }
+    }
+
+    /// Reports a recorded zip error as [`ArchiveError::InvalidArchive`]
+    /// instead of a raw [`ArchiveError::Io`].
+    fn into_result(self, path: &str, result: Result<()>) -> Result<()> {
+        match self.invalid {
+            Some(err) => Err(ArchiveError::InvalidArchive(format!("zip entry {path}: {err}"))),
+            None => result,
+        }
+    }
+}
+
+impl<R: Read> Read for ZipEntryReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf).inspect_err(|err| {
+            if err.kind() == io::ErrorKind::InvalidData && self.invalid.is_none() {
+                self.invalid = Some(err.to_string());
+            }
+        })
+    }
+}
+
 /// Metadata for an entry produced by [`ArchiveExtractor::extract_streaming`],
 /// without its contents. For a file entry, the contents are exposed to the
 /// callback via a live `&mut dyn Read` passed alongside this value, instead
@@ -1119,7 +1153,7 @@ impl ArchiveExtractor {
         for i in 0..archive.len() {
             let mut file = archive.by_index(i)?;
             let is_directory = file.is_dir();
-            let path = file.name().to_string();
+            let path = file.name()?.into_owned();
             validate_path(&path, self.allow_unsafe_path_traversals)?;
 
             let is_symlink = file
@@ -1152,7 +1186,9 @@ impl ArchiveExtractor {
                 // than streamed like a regular file's data would be.
                 let mut contents = Vec::new();
                 reserve_exact(&mut contents, size)?;
-                bounded_read_to_end(&mut file, &mut contents, self.max_file_size, Some(&path))?;
+                let mut entry_reader = ZipEntryReader::new(&mut file);
+                let result = bounded_read_to_end(&mut entry_reader, &mut contents, self.max_file_size, Some(&path));
+                entry_reader.into_result(&path, result)?;
 
                 total_size += contents.len();
                 if total_size > self.max_total_size {
@@ -1175,8 +1211,10 @@ impl ArchiveExtractor {
                 };
                 on_entry(&meta, &mut io::empty())?;
             } else {
-                let meta = EntryMeta { path, mode, mtime, is_dir: false, is_symlink: false, symlink_target: None, size: None };
-                self.stream_file_entry(meta, &mut file, &mut total_size, on_entry)?;
+                let meta = EntryMeta { path: path.clone(), mode, mtime, is_dir: false, is_symlink: false, symlink_target: None, size: None };
+                let mut entry_reader = ZipEntryReader::new(&mut file);
+                let result = self.stream_file_entry(meta, &mut entry_reader, &mut total_size, on_entry);
+                entry_reader.into_result(&path, result)?;
             }
         }
 
@@ -1379,7 +1417,7 @@ impl ArchiveExtractor {
         for i in 0..archive.len() {
             let mut file = archive.by_index(i)?;
             let is_directory = file.is_dir();
-            let path = file.name().to_string();
+            let path = file.name()?.into_owned();
             validate_path(&path, self.allow_unsafe_path_traversals)?;
 
             let is_symlink = file
@@ -1406,7 +1444,9 @@ impl ArchiveExtractor {
 
                 let mut contents = Vec::new();
                 reserve_exact(&mut contents, size)?;
-                bounded_read_to_end(&mut file, &mut contents, self.max_file_size, Some(&path))?;
+                let mut entry_reader = ZipEntryReader::new(&mut file);
+                let result = bounded_read_to_end(&mut entry_reader, &mut contents, self.max_file_size, Some(&path));
+                entry_reader.into_result(&path, result)?;
 
                 total_size += contents.len();
                 if total_size > self.max_total_size {

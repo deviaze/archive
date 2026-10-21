@@ -162,7 +162,7 @@ impl CompressionLevel {
     /// Builds the base [`zip::write::FileOptions`] carrying the compression
     /// method/level, shared by every entry in the archive. Per-entry mode
     /// and mtime are layered on top by the caller.
-    pub(crate) fn to_zip_options(self) -> Result<zip::write::FileOptions<'static, ()>> {
+    pub(crate) fn to_zip_options(self) -> Result<zip::write::FileOptions<'static, 'static, ()>> {
         let options = zip::write::FileOptions::default();
         match self {
             Self::Default => Ok(options),

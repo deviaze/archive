@@ -210,10 +210,10 @@ impl ArchiveBuilder {
     /// omitted rather than rejected — it's best-effort metadata, not
     /// something worth failing the whole build over.
     fn zip_file_options(
-        base: zip::write::FileOptions<'static, ()>,
+        base: zip::write::FileOptions<'static, 'static, ()>,
         mode: Option<u32>,
         mtime: Option<SystemTime>,
-    ) -> zip::write::FileOptions<'static, ()> {
+    ) -> zip::write::FileOptions<'static, 'static, ()> {
         let mut options = base;
         if let Some(mode) = mode {
             options = options.unix_permissions(mode);
